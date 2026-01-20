@@ -377,5 +377,108 @@
     (cl-letf (((symbol-function 'auth-source-op--cache-refresh) #'ignore))
       (should-not (auth-source-op--search-items "github.com")))))
 
+;;; Tests for Field Mapping
+
+(ert-deftest auth-source-op-test-extract-username-from-username-field ()
+  "Test extracting username from 'username' field."
+  (let ((item '((fields . [((label . "username") (value . "testuser"))]))))
+    (should (equal "testuser" (auth-source-op--extract-username item)))))
+
+(ert-deftest auth-source-op-test-extract-username-from-email-field ()
+  "Test extracting username from 'email' field."
+  (let ((item '((fields . [((label . "email") (value . "test@example.com"))]))))
+    (should (equal "test@example.com" (auth-source-op--extract-username item)))))
+
+(ert-deftest auth-source-op-test-extract-username-case-insensitive ()
+  "Test that username extraction is case-insensitive."
+  (let ((item '((fields . [((label . "USERNAME") (value . "testuser"))]))))
+    (should (equal "testuser" (auth-source-op--extract-username item)))))
+
+(ert-deftest auth-source-op-test-extract-username-by-id ()
+  "Test extracting username by field id."
+  (let ((item '((fields . [((id . "username") (label . "User Name") (value . "testuser"))]))))
+    (should (equal "testuser" (auth-source-op--extract-username item)))))
+
+(ert-deftest auth-source-op-test-extract-username-not-found ()
+  "Test that nil is returned when no username field exists."
+  (let ((item '((fields . [((label . "password") (value . "secret123"))]))))
+    (should-not (auth-source-op--extract-username item))))
+
+(ert-deftest auth-source-op-test-extract-username-no-fields ()
+  "Test that nil is returned when item has no fields."
+  (let ((item '((title . "Test Item"))))
+    (should-not (auth-source-op--extract-username item))))
+
+(ert-deftest auth-source-op-test-find-field-value-concealed-type ()
+  "Test that CONCEALED type fields are matched for password purpose."
+  (let ((item '((fields . [((label . "secret key") (type . "CONCEALED") (value . "mysecret"))]))))
+    (should (equal "mysecret"
+                   (auth-source-op--find-field-value item '("password") 'password)))))
+
+(ert-deftest auth-source-op-test-find-field-value-password-by-label ()
+  "Test finding password by label."
+  (let ((item '((fields . [((label . "password") (value . "secret123"))]))))
+    (should (equal "secret123"
+                   (auth-source-op--find-field-value item auth-source-op--secret-field-names 'password)))))
+
+(ert-deftest auth-source-op-test-secret-closure-deferred ()
+  "Test that secret closure defers fetching until called."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"password\", \"value\": \"secret123\"}]}" "")))
+        (fetch-called nil))
+    (auth-source-op-test--with-mocks
+      ;; Create closure - should not call op yet
+      (let ((closure (auth-source-op--make-secret-closure "test-id")))
+        (should (= 0 auth-source-op-test--mock-call-count))
+        ;; Call closure - should fetch now
+        (let ((secret (funcall closure)))
+          (should (= 1 auth-source-op-test--mock-call-count))
+          (should (equal "secret123" secret)))))))
+
+(ert-deftest auth-source-op-test-fetch-and-map-item ()
+  "Test mapping a 1Password item to auth-source format."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"username\", \"value\": \"myuser\"}, {\"label\": \"password\", \"value\": \"mypass\"}]}" ""))))
+    (auth-source-op-test--with-mocks
+      (let* ((item '((id . "test-id")
+                     (title . "Test Item")
+                     (urls . [((href . "https://example.com"))])))
+             (result (auth-source-op--fetch-and-map-item item)))
+        (should result)
+        (should (equal "example.com" (plist-get result :host)))
+        (should (equal "myuser" (plist-get result :user)))
+        (should (functionp (plist-get result :secret)))))))
+
+(ert-deftest auth-source-op-test-fetch-and-map-item-uses-title-as-host ()
+  "Test that title is used as host when no URLs present."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"username\", \"value\": \"myuser\"}]}" ""))))
+    (auth-source-op-test--with-mocks
+      (let* ((item '((id . "test-id") (title . "My Service")))
+             (result (auth-source-op--fetch-and-map-item item)))
+        (should (equal "My Service" (plist-get result :host)))))))
+
+(ert-deftest auth-source-op-test-fetch-and-map-item-fetch-failure ()
+  "Test that nil is returned when fetch fails."
+  (let ((auth-source-op-test--mock-executable-find nil))
+    (cl-letf (((symbol-function 'display-warning) #'ignore))
+      (auth-source-op-test--with-mocks
+        (let* ((item '((id . "test-id") (title . "Test Item")))
+               (result (auth-source-op--fetch-and-map-item item)))
+          (should-not result))))))
+
+(ert-deftest auth-source-op-test-secret-closure-returns-secret ()
+  "Test that calling the secret closure returns the password."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"password\", \"value\": \"supersecret\"}]}" ""))))
+    (auth-source-op-test--with-mocks
+      (let* ((closure (auth-source-op--make-secret-closure "item-123"))
+             (secret (funcall closure)))
+        (should (equal "supersecret" secret))))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here

@@ -69,6 +69,94 @@
                (string-match-p (regexp-quote pattern) stderr-lower))
              auth-source-op--cancel-patterns)))
 
+;;; Field Mapping
+
+(defconst auth-source-op--username-field-names
+  '("username" "user" "email" "login" "account")
+  "Field names to check when looking for a username.")
+
+(defconst auth-source-op--secret-field-names
+  '("password" "secret" "credential" "token" "api_key" "apikey" "key")
+  "Field names to check when looking for a secret.")
+
+(defun auth-source-op--fetch-item (item-id)
+  "Fetch the full item details from 1Password for ITEM-ID.
+Returns the item as an alist, or nil on failure."
+  (auth-source-op--call-op "item" "get" item-id "--format=json"))
+
+(defun auth-source-op--find-field-value (item field-names &optional purpose)
+  "Find a field value in ITEM matching one of FIELD-NAMES.
+FIELD-NAMES is a list of field names to search for (case-insensitive).
+PURPOSE is an optional symbol - if 'password, also checks the password field type.
+Returns the field value as a string, or nil if not found."
+  (let ((fields (alist-get 'fields item)))
+    (when fields
+      (let ((fields-list (if (vectorp fields) (append fields nil) fields)))
+        (cl-some
+         (lambda (field)
+           (let ((label (downcase (or (alist-get 'label field) "")))
+                 (id (downcase (or (alist-get 'id field) "")))
+                 (field-type (alist-get 'type field))
+                 (value (alist-get 'value field)))
+             (when (and value
+                        (or
+                         ;; Match by label or id
+                         (cl-some (lambda (name)
+                                    (or (string= (downcase name) label)
+                                        (string= (downcase name) id)))
+                                  field-names)
+                         ;; For password purpose, also match by field type
+                         (and (eq purpose 'password)
+                              (equal field-type "CONCEALED"))))
+               value)))
+         fields-list)))))
+
+(defun auth-source-op--extract-username (item)
+  "Extract the username from a 1Password ITEM.
+Returns the username as a string, or nil if not found."
+  (auth-source-op--find-field-value item auth-source-op--username-field-names))
+
+(defun auth-source-op--make-secret-closure (item-id)
+  "Create a zero-arg closure that fetches the secret for ITEM-ID.
+The closure fetches the secret lazily when called, implementing
+deferred retrieval as required by auth-source."
+  (lambda ()
+    (let ((item (auth-source-op--fetch-item item-id)))
+      (when item
+        (auth-source-op--find-field-value item auth-source-op--secret-field-names 'password)))))
+
+(defun auth-source-op--map-item-to-auth-source (item)
+  "Map a 1Password ITEM summary to an auth-source result.
+Returns a plist with :host, :user, and :secret keys.
+The :secret value is a zero-arg closure for deferred retrieval.
+Returns nil if the item cannot be mapped."
+  (let ((item-id (alist-get 'id item))
+        (title (alist-get 'title item))
+        (urls (auth-source-op--item-urls item)))
+    (when item-id
+      (let ((host (or (auth-source-op--extract-hostname (car urls))
+                      title)))
+        (list :host host
+              :user nil  ; Will be populated when full item is fetched
+              :secret (auth-source-op--make-secret-closure item-id))))))
+
+(defun auth-source-op--fetch-and-map-item (item)
+  "Fetch full details for ITEM and map to auth-source result.
+Returns a plist with :host, :user, and :secret keys.
+The :secret value is a zero-arg closure for deferred retrieval.
+Returns nil if the item cannot be fetched or mapped."
+  (let* ((item-id (alist-get 'id item))
+         (title (alist-get 'title item))
+         (urls (auth-source-op--item-urls item))
+         (full-item (when item-id (auth-source-op--fetch-item item-id))))
+    (when full-item
+      (let ((host (or (auth-source-op--extract-hostname (car urls))
+                      title))
+            (user (auth-source-op--extract-username full-item)))
+        (list :host host
+              :user user
+              :secret (auth-source-op--make-secret-closure item-id))))))
+
 ;;; Item Search
 
 (defun auth-source-op--extract-hostname (url)
