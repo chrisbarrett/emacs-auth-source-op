@@ -480,5 +480,72 @@
              (secret (funcall closure)))
         (should (equal "supersecret" secret))))))
 
+;;; Tests for Disambiguation UI
+
+(ert-deftest auth-source-op-test-format-item-with-url ()
+  "Test formatting an item with URL for display."
+  (let ((item '((title . "GitHub Personal") (urls . [((href . "https://github.com/login"))]))))
+    (should (equal "GitHub Personal (github.com)"
+                   (auth-source-op--format-item-for-display item)))))
+
+(ert-deftest auth-source-op-test-format-item-without-url ()
+  "Test formatting an item without URL for display."
+  (let ((item '((title . "API Token"))))
+    (should (equal "API Token"
+                   (auth-source-op--format-item-for-display item)))))
+
+(ert-deftest auth-source-op-test-format-item-no-title ()
+  "Test formatting an item without title."
+  (let ((item '((id . "123"))))
+    (should (equal "Untitled"
+                   (auth-source-op--format-item-for-display item)))))
+
+(ert-deftest auth-source-op-test-disambiguate-nil ()
+  "Test that disambiguate returns nil for empty list."
+  (should-not (auth-source-op--disambiguate nil)))
+
+(ert-deftest auth-source-op-test-disambiguate-single-item ()
+  "Test that single item is returned without prompting."
+  (let ((item '((id . "1") (title . "Test")))
+        (completing-read-called nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args)
+                 (setq completing-read-called t)
+                 nil)))
+      (let ((result (auth-source-op--disambiguate (list item))))
+        (should (equal item result))
+        (should-not completing-read-called)))))
+
+(ert-deftest auth-source-op-test-disambiguate-multiple-items ()
+  "Test that completing-read is called for multiple items."
+  (let ((item1 '((id . "1") (title . "GitHub")))
+        (item2 '((id . "2") (title . "GitLab"))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt candidates &rest _args)
+                 (car candidates))))  ; Return first candidate
+      (let ((result (auth-source-op--disambiguate (list item1 item2))))
+        (should (equal item1 result))))))
+
+(ert-deftest auth-source-op-test-disambiguate-user-cancels ()
+  "Test that nil is returned when user cancels selection."
+  (let ((item1 '((id . "1") (title . "GitHub")))
+        (item2 '((id . "2") (title . "GitLab"))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args)
+                 nil)))  ; User cancelled (keyboard-quit would throw, empty input returns nil)
+      (let ((result (auth-source-op--disambiguate (list item1 item2))))
+        (should-not result)))))
+
+(ert-deftest auth-source-op-test-disambiguate-selects-correct-item ()
+  "Test that the correct item is returned based on selection."
+  (let ((item1 '((id . "1") (title . "First Item")))
+        (item2 '((id . "2") (title . "Second Item")))
+        (item3 '((id . "3") (title . "Third Item"))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt candidates &rest _args)
+                 (nth 1 candidates))))  ; Select second candidate
+      (let ((result (auth-source-op--disambiguate (list item1 item2 item3))))
+        (should (equal item2 result))))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here

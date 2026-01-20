@@ -69,6 +69,35 @@
                (string-match-p (regexp-quote pattern) stderr-lower))
              auth-source-op--cancel-patterns)))
 
+;;; Disambiguation UI
+
+(defun auth-source-op--format-item-for-display (item)
+  "Format ITEM for display in completing-read.
+Returns a string showing the item title and first URL hostname."
+  (let* ((title (or (alist-get 'title item) "Untitled"))
+         (urls (auth-source-op--item-urls item))
+         (host (auth-source-op--extract-hostname (car urls))))
+    (if host
+        (format "%s (%s)" title host)
+      title)))
+
+(defun auth-source-op--disambiguate (items)
+  "Prompt user to select one item from ITEMS.
+Returns the selected item, or nil if cancelled.
+If ITEMS contains only one element, returns it without prompting."
+  (cond
+   ((null items) nil)
+   ((null (cdr items)) (car items))  ; Single item, no prompt needed
+   (t
+    (let* ((candidates (mapcar (lambda (item)
+                                 (cons (auth-source-op--format-item-for-display item) item))
+                               items))
+           (choice (completing-read "Select 1Password item: "
+                                    (mapcar #'car candidates)
+                                    nil t)))
+      (when choice
+        (cdr (assoc choice candidates)))))))
+
 ;;; Field Mapping
 
 (defconst auth-source-op--username-field-names
@@ -87,7 +116,7 @@ Returns the item as an alist, or nil on failure."
 (defun auth-source-op--find-field-value (item field-names &optional purpose)
   "Find a field value in ITEM matching one of FIELD-NAMES.
 FIELD-NAMES is a list of field names to search for (case-insensitive).
-PURPOSE is an optional symbol - if 'password, also checks the password field type.
+PURPOSE is an optional symbol; if \\='password, also checks the field type.
 Returns the field value as a string, or nil if not found."
   (let ((fields (alist-get 'fields item)))
     (when fields
