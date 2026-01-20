@@ -2,6 +2,11 @@
 
 Emacs auth-source backend for 1Password via the `op` CLI.
 
+## AI-Generated Code Notice
+
+This code was generated entirely by Claude (Anthropic) with human direction and
+review. The copyright status of LLM-generated code is legally uncertain.
+
 ## Overview
 
 This package enables `auth-source-search` to retrieve credentials from
@@ -154,9 +159,9 @@ returns nil, allowing auth-source to fall back to other backends like
 
 ## License
 
-Copyright (C) 2025 Chris Barrett
+This project is dual-licensed. You may choose either:
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation, either version 3 of the License, or (at your option) any later
-version.
+- **The Unlicense** (public domain dedication)
+- **GPL-3.0-or-later** (for compatibility with Emacs ecosystem)
+
+See [LICENSE](LICENSE) for details.
