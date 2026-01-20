@@ -343,6 +343,45 @@ Returns the new cache contents, or nil if fetch failed."
                (length auth-source-op--item-cache))
     (message "auth-source-op: Cache refresh failed")))
 
+;;;###autoload
+(defun auth-source-op-cache-clear ()
+  "Clear all cached 1Password data."
+  (interactive)
+  (auth-source-op--cache-clear)
+  (message "auth-source-op: Cache cleared"))
+
+;;;###autoload
+(defun auth-source-op-cache-list ()
+  "Display cached 1Password items in a buffer.
+Shows item titles and hostnames, but never displays secrets."
+  (interactive)
+  (let ((items (auth-source-op--cache-get)))
+    (if (null items)
+        (message "auth-source-op: No items in cache")
+      (with-current-buffer (get-buffer-create "*1Password Cache*")
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "1Password Cached Items (%d total)\n" (length items)))
+          (insert (make-string 40 ?=))
+          (insert "\n\n")
+          (dolist (item items)
+            (let* ((title (or (alist-get 'title item) "Untitled"))
+                   (id (alist-get 'id item))
+                   (urls (auth-source-op--item-urls item))
+                   (host (auth-source-op--extract-hostname (car urls)))
+                   (updated (alist-get 'updated_at item)))
+              (insert (format "• %s\n" title))
+              (when host
+                (insert (format "  Host: %s\n" host)))
+              (when id
+                (insert (format "  ID: %s\n" id)))
+              (when updated
+                (insert (format "  Updated: %s\n" updated)))
+              (insert "\n")))
+          (goto-char (point-min))
+          (special-mode))
+        (display-buffer (current-buffer))))))
+
 ;;; op CLI Interface
 
 (defun auth-source-op--check-op-available ()

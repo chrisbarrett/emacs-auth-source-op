@@ -781,5 +781,91 @@
     (auth-source-op-test--with-mocks
       (should-not (auth-source-op--detect-stale-items)))))
 
+;;; Tests for Cache Management UI
+
+(ert-deftest auth-source-op-test-cache-clear-command ()
+  "Test that cache-clear command clears cache and shows message."
+  (let ((auth-source-op--item-cache '(((id . "test"))))
+        (auth-source-op--cache-timestamp (current-time))
+        (auth-source-op--item-timestamps (make-hash-table :test 'equal))
+        (message-shown nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest _args)
+                 (when (string-match-p "cleared" fmt)
+                   (setq message-shown t)))))
+      (auth-source-op-cache-clear)
+      (should-not auth-source-op--item-cache)
+      (should-not auth-source-op--cache-timestamp)
+      (should-not auth-source-op--item-timestamps)
+      (should message-shown))))
+
+(ert-deftest auth-source-op-test-cache-list-empty ()
+  "Test that cache-list shows message when cache is empty."
+  (let ((auth-source-op--item-cache nil)
+        (message-shown nil))
+    (cl-letf (((symbol-function 'auth-source-op--cache-refresh) #'ignore)
+              ((symbol-function 'message)
+               (lambda (fmt &rest _args)
+                 (when (string-match-p "No items" fmt)
+                   (setq message-shown t)))))
+      (auth-source-op-cache-list)
+      (should message-shown))))
+
+(ert-deftest auth-source-op-test-cache-list-creates-buffer ()
+  "Test that cache-list creates buffer with item info."
+  (let ((auth-source-op--item-cache
+         '(((id . "item1")
+            (title . "GitHub")
+            (urls . [((href . "https://github.com"))])
+            (updated_at . "2025-01-15T10:00:00Z"))
+           ((id . "item2")
+            (title . "GitLab"))))
+        (buffer-displayed nil))
+    (cl-letf (((symbol-function 'display-buffer)
+               (lambda (buf)
+                 (setq buffer-displayed t)
+                 buf)))
+      (auth-source-op-cache-list)
+      (should buffer-displayed)
+      (with-current-buffer "*1Password Cache*"
+        (let ((content (buffer-string)))
+          ;; Check header
+          (should (string-match-p "1Password Cached Items (2 total)" content))
+          ;; Check first item
+          (should (string-match-p "• GitHub" content))
+          (should (string-match-p "Host: github.com" content))
+          (should (string-match-p "ID: item1" content))
+          (should (string-match-p "Updated: 2025-01-15T10:00:00Z" content))
+          ;; Check second item (no URL)
+          (should (string-match-p "• GitLab" content))
+          (should (string-match-p "ID: item2" content))
+          ;; Secrets should never appear (check for actual password values,
+          ;; not "1Password" in the title)
+          (should-not (string-match-p "password:" content))
+          (should-not (string-match-p "secret:" content))))
+      ;; Clean up
+      (kill-buffer "*1Password Cache*"))))
+
+(ert-deftest auth-source-op-test-cache-list-special-mode ()
+  "Test that cache-list buffer uses special-mode (read-only)."
+  (let ((auth-source-op--item-cache
+         '(((id . "item1") (title . "Test")))))
+    (cl-letf (((symbol-function 'display-buffer) #'ignore))
+      (auth-source-op-cache-list)
+      (with-current-buffer "*1Password Cache*"
+        (should (derived-mode-p 'special-mode))
+        (should buffer-read-only))
+      (kill-buffer "*1Password Cache*"))))
+
+(ert-deftest auth-source-op-test-cache-list-untitled-item ()
+  "Test that cache-list handles items without titles."
+  (let ((auth-source-op--item-cache
+         '(((id . "item1")))))  ; No title
+    (cl-letf (((symbol-function 'display-buffer) #'ignore))
+      (auth-source-op-cache-list)
+      (with-current-buffer "*1Password Cache*"
+        (should (string-match-p "• Untitled" (buffer-string))))
+      (kill-buffer "*1Password Cache*"))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here
