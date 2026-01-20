@@ -68,6 +68,48 @@
                (string-match-p (regexp-quote pattern) stderr-lower))
              auth-source-op--cancel-patterns)))
 
+;;; Item List Cache
+
+(defvar auth-source-op--item-cache nil
+  "Cached list of 1Password items.
+This is a list of item summaries from `op item list --format=json'.")
+
+(defvar auth-source-op--cache-timestamp nil
+  "Timestamp when the cache was last populated.")
+
+(defun auth-source-op--cache-get ()
+  "Return cached items, fetching from `op' if cache is empty.
+This is a read-through cache - it fetches on first access."
+  (unless auth-source-op--item-cache
+    (auth-source-op--cache-refresh))
+  auth-source-op--item-cache)
+
+(defun auth-source-op--cache-refresh ()
+  "Refresh the item cache from 1Password.
+Returns the new cache contents, or nil if fetch failed."
+  (let ((items (auth-source-op--call-op "item" "list" "--format=json")))
+    (when (and items (not (eq items t)))
+      (setq auth-source-op--item-cache (if (vectorp items)
+                                            (append items nil)
+                                          items))
+      (setq auth-source-op--cache-timestamp (current-time)))
+    auth-source-op--item-cache))
+
+(defun auth-source-op--cache-clear ()
+  "Clear the item cache."
+  (setq auth-source-op--item-cache nil)
+  (setq auth-source-op--cache-timestamp nil))
+
+;;;###autoload
+(defun auth-source-op-refresh-cache ()
+  "Force refresh of the 1Password item cache."
+  (interactive)
+  (auth-source-op--cache-clear)
+  (if (auth-source-op--cache-refresh)
+      (message "auth-source-op: Cache refreshed (%d items)"
+               (length auth-source-op--item-cache))
+    (message "auth-source-op: Cache refresh failed")))
+
 ;;; op CLI Interface
 
 (defun auth-source-op--check-op-available ()

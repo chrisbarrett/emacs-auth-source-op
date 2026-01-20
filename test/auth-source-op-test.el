@@ -184,5 +184,96 @@
     (auth-source-op-test--with-mocks
       (should (eq t (auth-source-op--call-op "signout"))))))
 
+;;; Tests for Item List Cache
+
+(ert-deftest auth-source-op-test-cache-get-fetches-on-first-access ()
+  "Test that cache-get fetches items on first access."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\"}, {\"id\": \"item2\"}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil))
+    (auth-source-op-test--with-mocks
+      (let ((items (auth-source-op--cache-get)))
+        (should items)
+        (should (= 2 (length items)))
+        (should (= 1 auth-source-op-test--mock-call-count))))))
+
+(ert-deftest auth-source-op-test-cache-get-returns-cached-on-subsequent ()
+  "Test that cache-get returns cached items without fetching again."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\"}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil))
+    (auth-source-op-test--with-mocks
+      ;; First access fetches
+      (auth-source-op--cache-get)
+      (should (= 1 auth-source-op-test--mock-call-count))
+      ;; Second access uses cache
+      (auth-source-op--cache-get)
+      (should (= 1 auth-source-op-test--mock-call-count)))))
+
+(ert-deftest auth-source-op-test-cache-refresh-forces-fetch ()
+  "Test that cache-refresh always fetches fresh data."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\"}]" "")
+           (0 "[{\"id\": \"item1\"}, {\"id\": \"item2\"}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil))
+    (auth-source-op-test--with-mocks
+      ;; First fetch
+      (auth-source-op--cache-refresh)
+      (should (= 1 (length auth-source-op--item-cache)))
+      ;; Force refresh
+      (auth-source-op--cache-refresh)
+      (should (= 2 (length auth-source-op--item-cache)))
+      (should (= 2 auth-source-op-test--mock-call-count)))))
+
+(ert-deftest auth-source-op-test-cache-clear-empties-cache ()
+  "Test that cache-clear empties the cache."
+  (let ((auth-source-op--item-cache '(((id . "test"))))
+        (auth-source-op--cache-timestamp (current-time)))
+    (auth-source-op--cache-clear)
+    (should-not auth-source-op--item-cache)
+    (should-not auth-source-op--cache-timestamp)))
+
+(ert-deftest auth-source-op-test-cache-sets-timestamp ()
+  "Test that cache refresh sets the timestamp."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\"}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil))
+    (auth-source-op-test--with-mocks
+      (auth-source-op--cache-refresh)
+      (should auth-source-op--cache-timestamp)
+      (should (time-less-p (time-subtract (current-time) 5)
+                           auth-source-op--cache-timestamp)))))
+
+(ert-deftest auth-source-op-test-cache-handles-fetch-failure ()
+  "Test that cache handles fetch failure gracefully."
+  (let ((auth-source-op-test--mock-executable-find nil)
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil))
+    (cl-letf (((symbol-function 'display-warning) #'ignore))
+      (auth-source-op-test--with-mocks
+        (should-not (auth-source-op--cache-refresh))
+        (should-not auth-source-op--item-cache)))))
+
+(ert-deftest auth-source-op-test-cache-converts-vector-to-list ()
+  "Test that cache converts JSON vector to list."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\"}, {\"id\": \"item2\"}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil))
+    (auth-source-op-test--with-mocks
+      (let ((items (auth-source-op--cache-get)))
+        ;; Should be a list, not a vector
+        (should (listp items))
+        (should-not (vectorp items))))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here
