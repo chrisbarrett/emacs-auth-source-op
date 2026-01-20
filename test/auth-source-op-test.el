@@ -674,5 +674,112 @@
       ;; Should still only have one 1password entry
       (should (= 1 (cl-count '1password auth-sources))))))
 
+;;; Tests for Cache Invalidation
+
+(ert-deftest auth-source-op-test-extract-item-timestamp ()
+  "Test extraction of updated_at timestamp from item."
+  (let ((item '((id . "1") (title . "Test") (updated_at . "2025-01-15T10:30:00Z"))))
+    (should (equal "2025-01-15T10:30:00Z"
+                   (auth-source-op--extract-item-timestamp item))))
+  ;; Missing timestamp
+  (let ((item '((id . "1") (title . "Test"))))
+    (should-not (auth-source-op--extract-item-timestamp item))))
+
+(ert-deftest auth-source-op-test-build-timestamp-index ()
+  "Test building timestamp index from items."
+  (let* ((items '(((id . "item1") (title . "First") (updated_at . "2025-01-15T10:00:00Z"))
+                  ((id . "item2") (title . "Second") (updated_at . "2025-01-15T11:00:00Z"))
+                  ((id . "item3") (title . "Third"))))  ; No timestamp
+         (index (auth-source-op--build-timestamp-index items)))
+    (should (hash-table-p index))
+    (should (equal "2025-01-15T10:00:00Z" (gethash "item1" index)))
+    (should (equal "2025-01-15T11:00:00Z" (gethash "item2" index)))
+    (should-not (gethash "item3" index))))  ; Missing timestamp not indexed
+
+(ert-deftest auth-source-op-test-item-stale-p-detects-change ()
+  "Test that stale detection identifies changed timestamps."
+  (let ((auth-source-op--item-timestamps (make-hash-table :test 'equal)))
+    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
+    ;; Same timestamp - not stale
+    (let ((item '((id . "item1") (updated_at . "2025-01-15T10:00:00Z"))))
+      (should-not (auth-source-op--item-stale-p item)))
+    ;; Different timestamp - stale
+    (let ((item '((id . "item1") (updated_at . "2025-01-15T12:00:00Z"))))
+      (should (auth-source-op--item-stale-p item)))))
+
+(ert-deftest auth-source-op-test-item-stale-p-no-cached-timestamp ()
+  "Test that items without cached timestamps are not considered stale."
+  (let ((auth-source-op--item-timestamps (make-hash-table :test 'equal)))
+    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
+    ;; New item not in cache - not stale (it's new, not changed)
+    (let ((item '((id . "item2") (updated_at . "2025-01-15T12:00:00Z"))))
+      (should-not (auth-source-op--item-stale-p item)))))
+
+(ert-deftest auth-source-op-test-item-stale-p-no-timestamp-table ()
+  "Test that nil timestamp table means nothing is stale."
+  (let ((auth-source-op--item-timestamps nil))
+    (let ((item '((id . "item1") (updated_at . "2025-01-15T12:00:00Z"))))
+      (should-not (auth-source-op--item-stale-p item)))))
+
+(ert-deftest auth-source-op-test-cache-refresh-builds-timestamp-index ()
+  "Test that cache refresh builds the timestamp index."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\", \"title\": \"Test\", \"updated_at\": \"2025-01-15T10:00:00Z\"}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil)
+        (auth-source-op--item-timestamps nil))
+    (auth-source-op-test--with-mocks
+      (auth-source-op--cache-refresh)
+      (should auth-source-op--item-timestamps)
+      (should (hash-table-p auth-source-op--item-timestamps))
+      (should (equal "2025-01-15T10:00:00Z"
+                     (gethash "item1" auth-source-op--item-timestamps))))))
+
+(ert-deftest auth-source-op-test-cache-clear-clears-timestamps ()
+  "Test that cache clear also clears timestamps."
+  (let ((auth-source-op--item-cache '(((id . "test"))))
+        (auth-source-op--cache-timestamp (current-time))
+        (auth-source-op--item-timestamps (make-hash-table :test 'equal)))
+    (puthash "test" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
+    (auth-source-op--cache-clear)
+    (should-not auth-source-op--item-timestamps)))
+
+(ert-deftest auth-source-op-test-detect-stale-items ()
+  "Test detection of stale items."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\", \"updated_at\": \"2025-01-15T12:00:00Z\"}, {\"id\": \"item2\", \"updated_at\": \"2025-01-15T10:00:00Z\"}]" "")))
+        (auth-source-op--item-timestamps (make-hash-table :test 'equal)))
+    ;; Set up cached timestamps - item1 has old timestamp, item2 is unchanged
+    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
+    (puthash "item2" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
+    (auth-source-op-test--with-mocks
+      (let ((stale (auth-source-op--detect-stale-items)))
+        ;; Only item1 should be stale (timestamp changed)
+        (should (= 1 (length stale)))
+        (should (equal "item1" (alist-get 'id (car (car stale)))))
+        ;; Old timestamp should be returned
+        (should (equal "2025-01-15T10:00:00Z" (cdr (car stale))))))))
+
+(ert-deftest auth-source-op-test-detect-stale-items-empty-cache ()
+  "Test that stale detection returns nil with no cached timestamps."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\", \"updated_at\": \"2025-01-15T12:00:00Z\"}]" "")))
+        (auth-source-op--item-timestamps nil))
+    (auth-source-op-test--with-mocks
+      (should-not (auth-source-op--detect-stale-items)))))
+
+(ert-deftest auth-source-op-test-detect-stale-items-no-changes ()
+  "Test that stale detection returns nil when nothing changed."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\", \"updated_at\": \"2025-01-15T10:00:00Z\"}]" "")))
+        (auth-source-op--item-timestamps (make-hash-table :test 'equal)))
+    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
+    (auth-source-op-test--with-mocks
+      (should-not (auth-source-op--detect-stale-items)))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here

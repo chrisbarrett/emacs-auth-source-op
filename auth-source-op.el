@@ -256,6 +256,57 @@ This is a list of item summaries from `op item list --format=json'.")
 (defvar auth-source-op--cache-timestamp nil
   "Timestamp when the cache was last populated.")
 
+(defvar auth-source-op--item-timestamps nil
+  "Hash table mapping item IDs to their `updated_at' timestamps.
+Used to detect stale items when re-fetching.")
+
+(defun auth-source-op--extract-item-timestamp (item)
+  "Extract the `updated_at' timestamp from ITEM.
+Returns the timestamp string, or nil if not present."
+  (alist-get 'updated_at item))
+
+(defun auth-source-op--build-timestamp-index (items)
+  "Build a hash table mapping item IDs to their `updated_at' timestamps.
+ITEMS is a list of 1Password item summaries."
+  (let ((index (make-hash-table :test 'equal)))
+    (dolist (item items)
+      (let ((id (alist-get 'id item))
+            (timestamp (auth-source-op--extract-item-timestamp item)))
+        (when (and id timestamp)
+          (puthash id timestamp index))))
+    index))
+
+(defun auth-source-op--item-stale-p (item)
+  "Check if ITEM has been updated since it was cached.
+Returns non-nil if the item's `updated_at' timestamp differs from cached.
+Returns nil if item is not stale, or if no cached timestamp exists."
+  (when auth-source-op--item-timestamps
+    (let* ((id (alist-get 'id item))
+           (current-timestamp (auth-source-op--extract-item-timestamp item))
+           (cached-timestamp (gethash id auth-source-op--item-timestamps)))
+      (and cached-timestamp
+           current-timestamp
+           (not (equal cached-timestamp current-timestamp))))))
+
+(defun auth-source-op--detect-stale-items ()
+  "Fetch current item list and return items that have changed since caching.
+Returns a list of (ITEM . OLD-TIMESTAMP) for items whose `updated_at'
+has changed. Returns nil if no stale items or on fetch failure."
+  (let ((current-items (auth-source-op--call-op "item" "list" "--format=json")))
+    (when (and current-items
+               (not (eq current-items t))
+               auth-source-op--item-timestamps)
+      (let ((items-list (if (vectorp current-items)
+                            (append current-items nil)
+                          current-items))
+            stale-items)
+        (dolist (item items-list)
+          (when (auth-source-op--item-stale-p item)
+            (let* ((id (alist-get 'id item))
+                   (old-timestamp (gethash id auth-source-op--item-timestamps)))
+              (push (cons item old-timestamp) stale-items))))
+        (nreverse stale-items)))))
+
 (defun auth-source-op--cache-get ()
   "Return cached items, fetching from `op' if cache is empty.
 This is a read-through cache - it fetches on first access."
@@ -271,13 +322,16 @@ Returns the new cache contents, or nil if fetch failed."
       (setq auth-source-op--item-cache (if (vectorp items)
                                             (append items nil)
                                           items))
-      (setq auth-source-op--cache-timestamp (current-time)))
+      (setq auth-source-op--cache-timestamp (current-time))
+      (setq auth-source-op--item-timestamps
+            (auth-source-op--build-timestamp-index auth-source-op--item-cache)))
     auth-source-op--item-cache))
 
 (defun auth-source-op--cache-clear ()
   "Clear the item cache."
   (setq auth-source-op--item-cache nil)
-  (setq auth-source-op--cache-timestamp nil))
+  (setq auth-source-op--cache-timestamp nil)
+  (setq auth-source-op--item-timestamps nil))
 
 ;;;###autoload
 (defun auth-source-op-refresh-cache ()
