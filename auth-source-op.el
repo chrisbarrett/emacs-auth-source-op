@@ -26,6 +26,7 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'url-parse)
 
 (defgroup auth-source-op nil
   "Auth-source backend for 1Password."
@@ -67,6 +68,62 @@
     (cl-some (lambda (pattern)
                (string-match-p (regexp-quote pattern) stderr-lower))
              auth-source-op--cancel-patterns)))
+
+;;; Item Search
+
+(defun auth-source-op--extract-hostname (url)
+  "Extract hostname from URL.
+Returns nil if URL is invalid or has no host."
+  (when (and url (stringp url))
+    (condition-case nil
+        (let ((parsed (url-generic-parse-url url)))
+          (let ((host (url-host parsed)))
+            (when (and host (not (string-empty-p host)))
+              (downcase host))))
+      (error nil))))
+
+(defun auth-source-op--item-urls (item)
+  "Return list of URLs from 1Password ITEM.
+Extracts URLs from the `urls' field of an item summary."
+  (let ((urls (alist-get 'urls item)))
+    (when urls
+      (mapcar (lambda (url-entry)
+                (alist-get 'href url-entry))
+              (if (vectorp urls) (append urls nil) urls)))))
+
+(defun auth-source-op--item-matches-host-p (item host)
+  "Return non-nil if ITEM has a URL matching HOST.
+Uses strict hostname matching - no wildcards or subdomain inference."
+  (when host
+    (let ((target-host (downcase host)))
+      (cl-some (lambda (url)
+                 (let ((item-host (auth-source-op--extract-hostname url)))
+                   (and item-host (string= item-host target-host))))
+               (auth-source-op--item-urls item)))))
+
+(defun auth-source-op--item-matches-title-p (item title)
+  "Return non-nil if ITEM title matches TITLE.
+Uses case-insensitive substring matching."
+  (when title
+    (let ((item-title (alist-get 'title item)))
+      (and item-title
+           (stringp item-title)
+           (string-match-p (regexp-quote (downcase title))
+                           (downcase item-title))))))
+
+(defun auth-source-op--search-items (host &optional title)
+  "Search cached items matching HOST and/or TITLE.
+HOST is matched against item URLs using strict hostname matching.
+TITLE is matched as a case-insensitive substring of item titles.
+If both HOST and TITLE are provided, items must match at least one.
+Returns a list of matching items."
+  (let ((items (auth-source-op--cache-get)))
+    (when items
+      (cl-remove-if-not
+       (lambda (item)
+         (or (auth-source-op--item-matches-host-p item host)
+             (auth-source-op--item-matches-title-p item title)))
+       items))))
 
 ;;; Item List Cache
 

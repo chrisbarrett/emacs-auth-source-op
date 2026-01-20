@@ -275,5 +275,107 @@
         (should (listp items))
         (should-not (vectorp items))))))
 
+;;; Tests for Item Search
+
+(ert-deftest auth-source-op-test-extract-hostname ()
+  "Test URL hostname extraction."
+  (should (equal "example.com"
+                 (auth-source-op--extract-hostname "https://example.com/path")))
+  (should (equal "example.com"
+                 (auth-source-op--extract-hostname "http://example.com")))
+  (should (equal "sub.example.com"
+                 (auth-source-op--extract-hostname "https://sub.example.com/")))
+  (should (equal "example.com"
+                 (auth-source-op--extract-hostname "https://EXAMPLE.COM/")))
+  (should-not (auth-source-op--extract-hostname nil))
+  (should-not (auth-source-op--extract-hostname ""))
+  (should-not (auth-source-op--extract-hostname "not-a-url")))
+
+(ert-deftest auth-source-op-test-item-urls ()
+  "Test extraction of URLs from item."
+  (let ((item '((urls . [((href . "https://example.com"))
+                         ((href . "https://other.com"))]))))
+    (should (equal '("https://example.com" "https://other.com")
+                   (auth-source-op--item-urls item))))
+  ;; No URLs
+  (let ((item '((title . "Test"))))
+    (should-not (auth-source-op--item-urls item))))
+
+(ert-deftest auth-source-op-test-item-matches-host-strict ()
+  "Test strict hostname matching - no subdomain inference."
+  (let ((item '((urls . [((href . "https://example.com/login"))]))))
+    ;; Exact match
+    (should (auth-source-op--item-matches-host-p item "example.com"))
+    ;; Case insensitive
+    (should (auth-source-op--item-matches-host-p item "EXAMPLE.COM"))
+    ;; Subdomain should NOT match parent
+    (should-not (auth-source-op--item-matches-host-p item "sub.example.com"))
+    ;; Parent should NOT match subdomain
+    (should-not (auth-source-op--item-matches-host-p item "com"))))
+
+(ert-deftest auth-source-op-test-item-matches-host-with-subdomain ()
+  "Test that subdomain in item matches only that exact subdomain."
+  (let ((item '((urls . [((href . "https://api.github.com"))]))))
+    (should (auth-source-op--item-matches-host-p item "api.github.com"))
+    (should-not (auth-source-op--item-matches-host-p item "github.com"))
+    (should-not (auth-source-op--item-matches-host-p item "other.github.com"))))
+
+(ert-deftest auth-source-op-test-item-matches-title ()
+  "Test title matching."
+  (let ((item '((title . "GitHub Personal Account"))))
+    ;; Substring match
+    (should (auth-source-op--item-matches-title-p item "GitHub"))
+    ;; Case insensitive
+    (should (auth-source-op--item-matches-title-p item "github"))
+    (should (auth-source-op--item-matches-title-p item "PERSONAL"))
+    ;; Full match
+    (should (auth-source-op--item-matches-title-p item "GitHub Personal Account"))
+    ;; No match
+    (should-not (auth-source-op--item-matches-title-p item "GitLab"))))
+
+(ert-deftest auth-source-op-test-search-items-by-host ()
+  "Test searching items by hostname."
+  (let ((auth-source-op--item-cache
+         (list '((id . "1") (title . "GitHub") (urls . [((href . "https://github.com"))]))
+               '((id . "2") (title . "GitLab") (urls . [((href . "https://gitlab.com"))]))
+               '((id . "3") (title . "Work GitHub") (urls . [((href . "https://github.enterprise.com"))])))))
+    (let ((results (auth-source-op--search-items "github.com")))
+      (should (= 1 (length results)))
+      (should (equal "1" (alist-get 'id (car results)))))))
+
+(ert-deftest auth-source-op-test-search-items-by-title ()
+  "Test searching items by title."
+  (let ((auth-source-op--item-cache
+         (list '((id . "1") (title . "GitHub Token"))
+               '((id . "2") (title . "GitLab Token"))
+               '((id . "3") (title . "AWS Access Key")))))
+    (let ((results (auth-source-op--search-items nil "Token")))
+      (should (= 2 (length results)))
+      (should (member "1" (mapcar (lambda (i) (alist-get 'id i)) results)))
+      (should (member "2" (mapcar (lambda (i) (alist-get 'id i)) results))))))
+
+(ert-deftest auth-source-op-test-search-items-host-or-title ()
+  "Test that search matches host OR title."
+  (let ((auth-source-op--item-cache
+         (list '((id . "1") (title . "GitHub") (urls . [((href . "https://github.com"))]))
+               '((id . "2") (title . "My GitLab") (urls . [((href . "https://gitlab.com"))]))
+               '((id . "3") (title . "GitHub Enterprise") (urls . [((href . "https://github.enterprise.com"))])))))
+    ;; Match by host OR title containing "GitHub"
+    (let ((results (auth-source-op--search-items "gitlab.com" "GitHub")))
+      (should (= 3 (length results))))))
+
+(ert-deftest auth-source-op-test-search-items-no-match ()
+  "Test search with no matches."
+  (let ((auth-source-op--item-cache
+         (list '((id . "1") (title . "GitHub") (urls . [((href . "https://github.com"))])))))
+    (should-not (auth-source-op--search-items "gitlab.com" "AWS"))))
+
+(ert-deftest auth-source-op-test-search-items-empty-cache ()
+  "Test search with empty cache."
+  (let ((auth-source-op--item-cache nil))
+    ;; Don't try to fetch in this test
+    (cl-letf (((symbol-function 'auth-source-op--cache-refresh) #'ignore))
+      (should-not (auth-source-op--search-items "github.com")))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here
