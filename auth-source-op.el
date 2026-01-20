@@ -26,7 +26,10 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'seq)
 (require 'url-parse)
+(require 'auth-source)
+(require 'eieio)
 
 (defgroup auth-source-op nil
   "Auth-source backend for 1Password."
@@ -156,7 +159,7 @@ deferred retrieval as required by auth-source."
 
 (defun auth-source-op--map-item-to-auth-source (item)
   "Map a 1Password ITEM summary to an auth-source result.
-Returns a plist with :host, :user, and :secret keys.
+Returns a plist with :host, :port, :user, and :secret keys.
 The :secret value is a zero-arg closure for deferred retrieval.
 Returns nil if the item cannot be mapped."
   (let ((item-id (alist-get 'id item))
@@ -166,12 +169,13 @@ Returns nil if the item cannot be mapped."
       (let ((host (or (auth-source-op--extract-hostname (car urls))
                       title)))
         (list :host host
+              :port nil  ; 1Password items don't have port metadata
               :user nil  ; Will be populated when full item is fetched
               :secret (auth-source-op--make-secret-closure item-id))))))
 
 (defun auth-source-op--fetch-and-map-item (item)
   "Fetch full details for ITEM and map to auth-source result.
-Returns a plist with :host, :user, and :secret keys.
+Returns a plist with :host, :port, :user, and :secret keys.
 The :secret value is a zero-arg closure for deferred retrieval.
 Returns nil if the item cannot be fetched or mapped."
   (let* ((item-id (alist-get 'id item))
@@ -183,6 +187,7 @@ Returns nil if the item cannot be fetched or mapped."
                       title))
             (user (auth-source-op--extract-username full-item)))
         (list :host host
+              :port nil  ; 1Password items don't have port metadata
               :user user
               :secret (auth-source-op--make-secret-closure item-id))))))
 
@@ -349,6 +354,77 @@ Signals an error on unexpected failures."
            (t
             (error "auth-source-op: `op' command failed: %s" stderr)))))
       result)))
+
+;;; Auth-Source Backend
+
+(cl-defun auth-source-op--search (&rest spec
+                                        &key backend type host user port
+                                        require max
+                                        &allow-other-keys)
+  "Search 1Password for credentials matching SPEC.
+BACKEND is the auth-source backend object.
+TYPE should be \\='1password or nil.
+HOST is the hostname to match against item URLs.
+USER is the username to match (used to filter results).
+PORT is ignored (1Password items don't have port metadata).
+REQUIRE is a list of required result keys.
+MAX is the maximum number of results to return.
+Returns a list of plists with :host, :user, and :secret keys."
+  (ignore backend type port require)
+  ;; Handle wildcard host - we don't support it
+  (when (eq host t)
+    (cl-return-from auth-source-op--search nil))
+  (let* ((items (auth-source-op--search-items host))
+         (max (or max 1))
+         results)
+    ;; Disambiguate if multiple items match and we only want one
+    (when (and items (= max 1) (> (length items) 1))
+      (setq items (list (auth-source-op--disambiguate items))))
+    ;; Filter out nil (from cancelled disambiguation)
+    (setq items (delq nil items))
+    ;; Limit to max results
+    (setq items (seq-take items max))
+    ;; Fetch full details and map to auth-source format
+    (dolist (item items)
+      (when-let* ((result (auth-source-op--fetch-and-map-item item)))
+        ;; Filter by user if specified
+        (when (or (null user)
+                  (eq user t)
+                  (equal user (plist-get result :user)))
+          (push result results))))
+    (nreverse results)))
+
+(defvar auth-source-op-backend
+  (auth-source-backend
+   :source "1Password"
+   :type '1password
+   :search-function #'auth-source-op--search)
+  "Auth-source backend for 1Password.")
+
+(defun auth-source-op--backend-parse (entry)
+  "Create a 1Password auth-source backend from ENTRY.
+Returns the backend when ENTRY is the symbol \\='1password, nil otherwise."
+  (when (eq entry '1password)
+    (auth-source-backend-parse-parameters entry auth-source-op-backend)))
+
+;;;###autoload
+(defun auth-source-op-enable ()
+  "Enable 1Password as an auth-source backend.
+Adds \\='1password to the front of `auth-sources'."
+  (interactive)
+  (unless (auth-source-op--check-op-available)
+    (user-error "Cannot enable auth-source-op: `op' CLI not found"))
+  ;; Register the backend parser
+  (if (boundp 'auth-source-backend-parser-functions)
+      (add-hook 'auth-source-backend-parser-functions
+                #'auth-source-op--backend-parse)
+    ;; Fallback for older Emacs versions
+    (advice-add 'auth-source-backend-parse :before-until
+                #'auth-source-op--backend-parse))
+  ;; Add to auth-sources if not already present
+  (unless (memq '1password auth-sources)
+    (push '1password auth-sources))
+  (message "auth-source-op: 1Password backend enabled"))
 
 (provide 'auth-source-op)
 ;;; auth-source-op.el ends here

@@ -547,5 +547,132 @@
       (let ((result (auth-source-op--disambiguate (list item1 item2 item3))))
         (should (equal item2 result))))))
 
+;;; Tests for Auth-Source Backend
+
+(ert-deftest auth-source-op-test-backend-parse-matches-1password ()
+  "Test that backend parser matches '1password symbol."
+  (should (auth-source-op--backend-parse '1password)))
+
+(ert-deftest auth-source-op-test-backend-parse-ignores-other ()
+  "Test that backend parser returns nil for other entries."
+  (should-not (auth-source-op--backend-parse 'password-store))
+  (should-not (auth-source-op--backend-parse "~/.authinfo"))
+  (should-not (auth-source-op--backend-parse nil)))
+
+(ert-deftest auth-source-op-test-search-returns-nil-for-wildcard-host ()
+  "Test that search returns nil when host is t (wildcard)."
+  (should-not (auth-source-op--search :host t)))
+
+(ert-deftest auth-source-op-test-search-returns-nil-for-nil-host ()
+  "Test that search returns nil when host is nil."
+  (let ((auth-source-op--item-cache
+         '(((id . "1") (title . "GitHub") (urls . [((href . "https://github.com"))])))))
+    ;; With no host, search-items returns nothing (no match criteria)
+    (should-not (auth-source-op--search :host nil))))
+
+(ert-deftest auth-source-op-test-search-returns-nil-for-no-matches ()
+  "Test that search returns nil when no items match."
+  (let ((auth-source-op--item-cache
+         '(((id . "1") (title . "GitHub") (urls . [((href . "https://github.com"))])))))
+    (should-not (auth-source-op--search :host "gitlab.com"))))
+
+(ert-deftest auth-source-op-test-search-returns-results-for-match ()
+  "Test that search returns results for matching host."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"username\", \"value\": \"myuser\"}, {\"label\": \"password\", \"value\": \"mypass\"}]}" "")))
+        (auth-source-op--item-cache
+         '(((id . "item1") (title . "GitHub") (urls . [((href . "https://github.com"))])))))
+    (auth-source-op-test--with-mocks
+      (let ((results (auth-source-op--search :host "github.com")))
+        (should results)
+        (should (= 1 (length results)))
+        (should (equal "github.com" (plist-get (car results) :host)))
+        (should (equal "myuser" (plist-get (car results) :user)))
+        (should (functionp (plist-get (car results) :secret)))))))
+
+(ert-deftest auth-source-op-test-search-respects-max ()
+  "Test that search respects :max parameter."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"username\", \"value\": \"user1\"}]}" "")
+           (0 "{\"fields\": [{\"label\": \"username\", \"value\": \"user2\"}]}" "")))
+        (auth-source-op--item-cache
+         '(((id . "1") (title . "GitHub 1") (urls . [((href . "https://github.com"))]))
+           ((id . "2") (title . "GitHub 2") (urls . [((href . "https://github.com"))])))))
+    (auth-source-op-test--with-mocks
+      (let ((results (auth-source-op--search :host "github.com" :max 2)))
+        (should (= 2 (length results)))))))
+
+(ert-deftest auth-source-op-test-search-filters-by-user ()
+  "Test that search filters results by :user parameter."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"username\", \"value\": \"wronguser\"}, {\"label\": \"password\", \"value\": \"pass1\"}]}" "")
+           (0 "{\"fields\": [{\"label\": \"username\", \"value\": \"rightuser\"}, {\"label\": \"password\", \"value\": \"pass2\"}]}" "")))
+        (auth-source-op--item-cache
+         '(((id . "1") (title . "Account 1") (urls . [((href . "https://github.com"))]))
+           ((id . "2") (title . "Account 2") (urls . [((href . "https://github.com"))])))))
+    (auth-source-op-test--with-mocks
+      (let ((results (auth-source-op--search :host "github.com" :user "rightuser" :max 2)))
+        (should (= 1 (length results)))
+        (should (equal "rightuser" (plist-get (car results) :user)))))))
+
+(ert-deftest auth-source-op-test-search-disambiguates-single-max ()
+  "Test that search calls disambiguate when multiple matches and max=1."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"username\", \"value\": \"user2\"}]}" "")))
+        (auth-source-op--item-cache
+         '(((id . "1") (title . "GitHub Work") (urls . [((href . "https://github.com"))]))
+           ((id . "2") (title . "GitHub Personal") (urls . [((href . "https://github.com"))]))))
+        (disambiguate-called nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt candidates &rest _args)
+                 (setq disambiguate-called t)
+                 ;; Select the second item
+                 (nth 1 candidates))))
+      (auth-source-op-test--with-mocks
+        (let ((results (auth-source-op--search :host "github.com" :max 1)))
+          (should disambiguate-called)
+          (should (= 1 (length results))))))))
+
+(ert-deftest auth-source-op-test-search-returns-nil-when-disambiguation-cancelled ()
+  "Test that search returns nil when user cancels disambiguation."
+  (let ((auth-source-op--item-cache
+         '(((id . "1") (title . "GitHub Work") (urls . [((href . "https://github.com"))]))
+           ((id . "2") (title . "GitHub Personal") (urls . [((href . "https://github.com"))])))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args)
+                 nil)))  ; User cancelled
+      (should-not (auth-source-op--search :host "github.com" :max 1)))))
+
+(ert-deftest auth-source-op-test-enable-adds-to-auth-sources ()
+  "Test that enable adds 1password to auth-sources."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-sources '("~/.authinfo.gpg")))
+    (auth-source-op-test--with-mocks
+      (auth-source-op-enable)
+      (should (memq '1password auth-sources))
+      ;; Should be at the front
+      (should (eq '1password (car auth-sources))))))
+
+(ert-deftest auth-source-op-test-enable-errors-without-op ()
+  "Test that enable signals error when op CLI is not found."
+  (let ((auth-source-op-test--mock-executable-find nil))
+    (cl-letf (((symbol-function 'display-warning) #'ignore))
+      (auth-source-op-test--with-mocks
+        (should-error (auth-source-op-enable)
+                      :type 'user-error)))))
+
+(ert-deftest auth-source-op-test-enable-idempotent ()
+  "Test that enable is idempotent - doesn't add duplicate entries."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-sources '(1password "~/.authinfo.gpg")))
+    (auth-source-op-test--with-mocks
+      (auth-source-op-enable)
+      ;; Should still only have one 1password entry
+      (should (= 1 (cl-count '1password auth-sources))))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here
