@@ -45,6 +45,13 @@
   :type 'integer
   :group 'auth-source-op)
 
+(defcustom auth-source-op-vaults nil
+  "List of 1Password vaults to search for credentials.
+Each element can be a vault name (e.g., \"Personal\") or vault ID.
+When nil or empty, all vaults are searched (default behavior)."
+  :type '(repeat string)
+  :group 'auth-source-op)
+
 ;;; Error Pattern Detection
 
 (defconst auth-source-op--biometric-patterns
@@ -237,6 +244,22 @@ Uses case-insensitive substring matching."
            (string-match-p (regexp-quote (downcase title))
                            (downcase item-title))))))
 
+(defun auth-source-op--item-in-vault-p (item)
+  "Return non-nil if ITEM is in one of the configured vaults.
+When `auth-source-op-vaults' is nil or empty, returns t for all items.
+Matches against both vault name and vault ID (case-insensitive for names)."
+  (if (null auth-source-op-vaults)
+      t
+    (let* ((vault (alist-get 'vault item))
+           (vault-id (alist-get 'id vault))
+           (vault-name (alist-get 'name vault)))
+      (cl-some (lambda (configured-vault)
+                 (or (and vault-id (string= configured-vault vault-id))
+                     (and vault-name
+                          (string= (downcase configured-vault)
+                                   (downcase vault-name)))))
+               auth-source-op-vaults))))
+
 (defun auth-source-op--search-items (host &optional title)
   "Search cached items matching HOST and/or TITLE.
 HOST is matched against item URLs using strict hostname matching.
@@ -320,15 +343,26 @@ This is a read-through cache - it fetches on first access."
 
 (defun auth-source-op--cache-refresh ()
   "Refresh the item cache from 1Password.
-Returns the new cache contents, or nil if fetch failed."
-  (let ((items (auth-source-op--call-op "item" "list" "--format=json")))
+Returns the new cache contents, or nil if fetch failed.
+Items are filtered by `auth-source-op-vaults' if configured.
+When a single vault is configured, uses --vault flag for efficiency."
+  (let* ((single-vault (and auth-source-op-vaults
+                            (null (cdr auth-source-op-vaults))
+                            (car auth-source-op-vaults)))
+         (items (if single-vault
+                    (auth-source-op--call-op "item" "list"
+                                             (format "--vault=%s" single-vault)
+                                             "--format=json")
+                  (auth-source-op--call-op "item" "list" "--format=json"))))
     (when (and items (not (eq items t)))
-      (setq auth-source-op--item-cache (if (vectorp items)
-                                           (append items nil)
-                                         items))
-      (setq auth-source-op--cache-timestamp (current-time))
-      (setq auth-source-op--item-timestamps
-            (auth-source-op--build-timestamp-index auth-source-op--item-cache)))
+      (let ((items-list (if (vectorp items) (append items nil) items)))
+        (setq auth-source-op--item-cache
+              (if single-vault
+                  items-list
+                (cl-remove-if-not #'auth-source-op--item-in-vault-p items-list)))
+        (setq auth-source-op--cache-timestamp (current-time))
+        (setq auth-source-op--item-timestamps
+              (auth-source-op--build-timestamp-index auth-source-op--item-cache))))
     auth-source-op--item-cache))
 
 (defun auth-source-op--cache-clear ()
