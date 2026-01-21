@@ -79,7 +79,7 @@
 ;;; Disambiguation UI
 
 (defun auth-source-op--format-item-for-display (item)
-  "Format ITEM for display in completing-read.
+  "Format ITEM for display in `completing-read'.
 Returns a string showing the item title and first URL hostname."
   (let* ((title (or (alist-get 'title item) "Untitled"))
          (urls (auth-source-op--item-urls item))
@@ -324,8 +324,8 @@ Returns the new cache contents, or nil if fetch failed."
   (let ((items (auth-source-op--call-op "item" "list" "--format=json")))
     (when (and items (not (eq items t)))
       (setq auth-source-op--item-cache (if (vectorp items)
-                                            (append items nil)
-                                          items))
+                                           (append items nil)
+                                         items))
       (setq auth-source-op--cache-timestamp (current-time))
       (setq auth-source-op--item-timestamps
             (auth-source-op--build-timestamp-index auth-source-op--item-cache)))
@@ -511,17 +511,8 @@ Adds \\='1password to the front of `auth-sources'."
   (interactive)
   (unless (auth-source-op--check-op-available)
     (user-error "Cannot enable auth-source-op: `op' CLI not found"))
-  ;; Register the backend parser
-  (if (boundp 'auth-source-backend-parser-functions)
-      (add-hook 'auth-source-backend-parser-functions
-                #'auth-source-op--backend-parse)
-    ;; Fallback for older Emacs versions
-    (advice-add 'auth-source-backend-parse :before-until
-                #'auth-source-op--backend-parse))
-  ;; Add to auth-sources if not already present
-  (unless (memq '1password auth-sources)
-    (push '1password auth-sources))
-  (message "auth-source-op: 1Password backend enabled"))
+  (add-hook 'auth-source-backend-parser-functions #'auth-source-op--backend-parse)
+  (add-to-list 'auth-sources '1password))
 
 (provide 'auth-source-op)
 ;;; auth-source-op.el ends here
