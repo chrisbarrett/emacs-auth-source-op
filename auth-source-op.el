@@ -206,10 +206,14 @@ Returns nil if the item cannot be fetched or mapped."
 
 (defun auth-source-op--extract-hostname (url)
   "Extract hostname from URL.
-Returns nil if URL is invalid or has no host."
+Returns nil if URL is invalid or has no host.
+Handles URLs without a protocol by prepending https://."
   (when (and url (stringp url))
     (condition-case nil
-        (let ((parsed (url-generic-parse-url url)))
+        (let* ((normalized-url (if (string-match-p "\\`[a-zA-Z][a-zA-Z0-9+.-]*://" url)
+                                   url
+                                 (concat "https://" url)))
+               (parsed (url-generic-parse-url normalized-url)))
           (let ((host (url-host parsed)))
             (when (and host (not (string-empty-p host)))
               (downcase host))))
