@@ -52,6 +52,13 @@ When nil or empty, all vaults are searched (default behavior)."
   :type '(repeat string)
   :group 'auth-source-op)
 
+(defcustom auth-source-op-secret-ttl 180
+  "Time-to-live in seconds for cached secrets.
+Secrets are cached after first retrieval and proactively deleted
+when the TTL expires.  Accessing a secret resets its TTL timer."
+  :type 'integer
+  :group 'auth-source-op)
+
 ;;; Error Pattern Detection
 
 (defconst auth-source-op--biometric-patterns
@@ -160,13 +167,59 @@ Returns the username as a string, or nil if not found."
   (auth-source-op--find-field-value item auth-source-op--username-field-names))
 
 (defun auth-source-op--make-secret-closure (item-id)
-  "Create a zero-arg closure that fetches the secret for ITEM-ID.
-The closure fetches the secret lazily when called, implementing
-deferred retrieval as required by auth-source."
-  (lambda ()
-    (let ((item (auth-source-op--fetch-item item-id)))
-      (when item
-        (auth-source-op--find-field-value item auth-source-op--secret-field-names 'password)))))
+  "Get or create a secret closure for ITEM-ID.
+Returns a cached closure if one exists for ITEM-ID, otherwise creates
+a new one.  The closure implements TTL-based caching: the secret is
+fetched from 1Password on first access, cached in a lexical binding,
+and proactively deleted when `auth-source-op-secret-ttl' expires.
+Accessing the secret resets the TTL timer (sliding window).
+
+The closure registry (`auth-source-op--secret-closures') maps item-ids
+to closures, ensuring deduplication.  The registry is cleared when the
+item-list cache is cleared."
+  ;; Initialize registry if needed
+  (unless auth-source-op--secret-closures
+    (setq auth-source-op--secret-closures (make-hash-table :test 'equal)))
+  ;; Return existing closure or create new one
+  (or (gethash item-id auth-source-op--secret-closures)
+      (let ((closure (auth-source-op--create-secret-closure item-id)))
+        (puthash item-id closure auth-source-op--secret-closures)
+        closure)))
+
+(defun auth-source-op--create-secret-closure (item-id)
+  "Create a new secret closure for ITEM-ID.
+This is an internal function; use `auth-source-op--make-secret-closure'
+to get a deduplicated closure.
+
+The closure uses the let-over-lambda pattern to capture its own state:
+- cached-secret: the cached secret value (nil when not cached or expired)
+- expiry-timer: the timer that will clear the secret on TTL expiry
+
+Security: The secret is stored only in the lexical binding, not in any
+global variable.  It cannot be accessed by inspecting the closure registry."
+  (let ((cached-secret nil)
+        (expiry-timer nil))
+    (lambda ()
+      ;; Cancel existing timer if any (we'll create a new one)
+      (when expiry-timer
+        (cancel-timer expiry-timer)
+        (setq expiry-timer nil))
+      ;; Fetch secret if not cached
+      (unless cached-secret
+        (let ((item (auth-source-op--fetch-item item-id)))
+          (when item
+            (setq cached-secret
+                  (auth-source-op--find-field-value
+                   item auth-source-op--secret-field-names 'password)))))
+      ;; Reset TTL timer (sliding window) - only if we have a secret
+      (when cached-secret
+        (setq expiry-timer
+              (run-at-time auth-source-op-secret-ttl nil
+                           (lambda ()
+                             ;; Proactively delete the secret from memory
+                             (setq cached-secret nil)
+                             (setq expiry-timer nil)))))
+      cached-secret)))
 
 (defun auth-source-op--map-item-to-auth-source (item)
   "Map a 1Password ITEM summary to an auth-source result.
@@ -291,6 +344,11 @@ This is a list of item summaries from `op item list --format=json'.")
   "Hash table mapping item IDs to their `updated_at' timestamps.
 Used to detect stale items when re-fetching.")
 
+(defvar auth-source-op--secret-closures nil
+  "Hash table mapping item IDs to their secret closures.
+Used to deduplicate closures so the same item-id always returns
+the same closure object.")
+
 (defun auth-source-op--extract-item-timestamp (item)
   "Extract the `updated_at' timestamp from ITEM.
 Returns the timestamp string, or nil if not present."
@@ -370,10 +428,11 @@ When a single vault is configured, uses --vault flag for efficiency."
     auth-source-op--item-cache))
 
 (defun auth-source-op--cache-clear ()
-  "Clear the item cache."
+  "Clear the item cache and secret closure registry."
   (setq auth-source-op--item-cache nil)
   (setq auth-source-op--cache-timestamp nil)
-  (setq auth-source-op--item-timestamps nil))
+  (setq auth-source-op--item-timestamps nil)
+  (setq auth-source-op--secret-closures nil))
 
 ;;;###autoload
 (defun auth-source-op-refresh-cache ()

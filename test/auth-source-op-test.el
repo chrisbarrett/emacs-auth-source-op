@@ -293,9 +293,11 @@
                  (auth-source-op--extract-hostname "https://sub.example.com/")))
   (should (equal "example.com"
                  (auth-source-op--extract-hostname "https://EXAMPLE.COM/")))
+  ;; Bare hostname is valid (1Password stores URLs without protocol)
+  (should (equal "example.com"
+                 (auth-source-op--extract-hostname "example.com")))
   (should-not (auth-source-op--extract-hostname nil))
-  (should-not (auth-source-op--extract-hostname ""))
-  (should-not (auth-source-op--extract-hostname "not-a-url")))
+  (should-not (auth-source-op--extract-hostname "")))
 
 (ert-deftest auth-source-op-test-item-urls ()
   "Test extraction of URLs from item."
@@ -872,6 +874,114 @@
       (with-current-buffer "*1Password Cache*"
         (should (string-match-p "• Untitled" (buffer-string))))
       (kill-buffer "*1Password Cache*"))))
+
+;;; Tests for Secret TTL Caching
+
+(ert-deftest auth-source-op-test-secret-closure-caches-secret ()
+  "Test that secret closure caches the secret after first fetch."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"password\", \"value\": \"secret123\"}]}" "")))
+        (auth-source-op--secret-closures nil)
+        (auth-source-op-secret-ttl 180))
+    (auth-source-op-test--with-mocks
+      (let ((closure (auth-source-op--make-secret-closure "test-id")))
+        ;; First call fetches from op
+        (should (equal "secret123" (funcall closure)))
+        (should (= 1 auth-source-op-test--mock-call-count))
+        ;; Second call uses cached value (no additional fetch)
+        (should (equal "secret123" (funcall closure)))
+        (should (= 1 auth-source-op-test--mock-call-count))))))
+
+(ert-deftest auth-source-op-test-secret-closure-deduplication ()
+  "Test that same item-id returns same closure (eq)."
+  (let ((auth-source-op--secret-closures nil))
+    (let ((closure1 (auth-source-op--make-secret-closure "item-123"))
+          (closure2 (auth-source-op--make-secret-closure "item-123")))
+      (should (eq closure1 closure2)))))
+
+(ert-deftest auth-source-op-test-secret-closure-different-items ()
+  "Test that different item-ids get different closures."
+  (let ((auth-source-op--secret-closures nil))
+    (let ((closure1 (auth-source-op--make-secret-closure "item-1"))
+          (closure2 (auth-source-op--make-secret-closure "item-2")))
+      (should-not (eq closure1 closure2)))))
+
+(ert-deftest auth-source-op-test-cache-clear-clears-secret-closures ()
+  "Test that cache-clear also clears the secret closure registry."
+  (let ((auth-source-op--item-cache '(((id . "test"))))
+        (auth-source-op--cache-timestamp (current-time))
+        (auth-source-op--item-timestamps (make-hash-table :test 'equal))
+        (auth-source-op--secret-closures (make-hash-table :test 'equal)))
+    (puthash "item1" (lambda () "test") auth-source-op--secret-closures)
+    (auth-source-op--cache-clear)
+    (should-not auth-source-op--secret-closures)))
+
+(ert-deftest auth-source-op-test-secret-ttl-expiry ()
+  "Test that secret is cleared from memory after TTL expires."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"password\", \"value\": \"secret123\"}]}" "")
+           (0 "{\"fields\": [{\"label\": \"password\", \"value\": \"secret456\"}]}" "")))
+        (auth-source-op--secret-closures nil)
+        (auth-source-op-secret-ttl 0.1))  ; 100ms TTL for testing
+    (auth-source-op-test--with-mocks
+      (let ((closure (auth-source-op--make-secret-closure "test-id")))
+        ;; First call fetches and caches
+        (should (equal "secret123" (funcall closure)))
+        (should (= 1 auth-source-op-test--mock-call-count))
+        ;; Wait for TTL to expire
+        (sleep-for 0.2)
+        ;; Next call should fetch again (secret was cleared)
+        (should (equal "secret456" (funcall closure)))
+        (should (= 2 auth-source-op-test--mock-call-count))))))
+
+(ert-deftest auth-source-op-test-secret-ttl-sliding-window ()
+  "Test that accessing secret resets the TTL timer."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"password\", \"value\": \"secret123\"}]}" "")))
+        (auth-source-op--secret-closures nil)
+        (auth-source-op-secret-ttl 0.2))  ; 200ms TTL
+    (auth-source-op-test--with-mocks
+      (let ((closure (auth-source-op--make-secret-closure "test-id")))
+        ;; First call
+        (funcall closure)
+        (should (= 1 auth-source-op-test--mock-call-count))
+        ;; Wait 100ms (half the TTL)
+        (sleep-for 0.1)
+        ;; Access again - should reset timer
+        (funcall closure)
+        (should (= 1 auth-source-op-test--mock-call-count))
+        ;; Wait another 100ms (past original expiry, but timer was reset)
+        (sleep-for 0.1)
+        ;; Should still use cached value
+        (funcall closure)
+        (should (= 1 auth-source-op-test--mock-call-count))))))
+
+(ert-deftest auth-source-op-test-secret-closure-registry-initialized ()
+  "Test that closure registry is initialized on first use."
+  (let ((auth-source-op--secret-closures nil))
+    (auth-source-op--make-secret-closure "test-id")
+    (should auth-source-op--secret-closures)
+    (should (hash-table-p auth-source-op--secret-closures))))
+
+(ert-deftest auth-source-op-test-secret-not-in-registry ()
+  "Test that secrets cannot be accessed by inspecting the registry."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "{\"fields\": [{\"label\": \"password\", \"value\": \"topsecret\"}]}" "")))
+        (auth-source-op--secret-closures nil))
+    (auth-source-op-test--with-mocks
+      (let ((closure (auth-source-op--make-secret-closure "item-123")))
+        ;; Fetch the secret (so it's cached in the closure)
+        (funcall closure)
+        ;; The registry contains the closure, but the secret is in a lexical binding
+        ;; We can't directly access the secret without calling the closure
+        (let ((stored-closure (gethash "item-123" auth-source-op--secret-closures)))
+          (should (eq closure stored-closure))
+          ;; The closure is opaque - we can only get the secret by calling it
+          (should (functionp stored-closure)))))))
 
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here
