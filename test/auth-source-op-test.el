@@ -909,5 +909,121 @@
           ;; The closure is opaque - we can only get the secret by calling it
           (should (functionp stored-closure)))))))
 
+;;; Tests for Spec Coverage Gaps
+
+(ert-deftest auth-source-op-test-call-op-json-parse-failure ()
+  "Test that invalid JSON is returned as raw string."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "not valid json" ""))))
+    (auth-source-op-test--with-mocks
+      (should (equal "not valid json"
+                     (auth-source-op--call-op "item" "get" "test"))))))
+
+(ert-deftest auth-source-op-test-build-args-no-account ()
+  "Test that build-args omits --account when nil."
+  (let ((auth-source-op-account nil))
+    (should (equal '("item" "list" "--format=json")
+                   (auth-source-op--build-args '("item" "list" "--format=json"))))))
+
+(ert-deftest auth-source-op-test-build-args-with-account ()
+  "Test that build-args appends --account when set."
+  (let ((auth-source-op-account "my-account"))
+    (should (equal '("item" "list" "--format=json" "--account=my-account")
+                   (auth-source-op--build-args '("item" "list" "--format=json"))))))
+
+(ert-deftest auth-source-op-test-build-args-filters-nil ()
+  "Test that build-args filters nil values from args."
+  (let ((auth-source-op-account nil))
+    (should (equal '("item" "list")
+                   (auth-source-op--build-args '("item" nil "list"))))))
+
+(ert-deftest auth-source-op-test-vault-filter-single ()
+  "Test single vault uses --vault flag."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\", \"vault\": {\"id\": \"v1\", \"name\": \"Personal\"}}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil)
+        (auth-source-op--item-timestamps nil)
+        (auth-source-op-vaults '("Personal"))
+        (captured-args nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_cmd) auth-source-op-test--mock-executable-find))
+              ((symbol-function 'call-process)
+               (lambda (_program &optional _infile destination _display &rest args)
+                 (setq captured-args args)
+                 (insert "[{\"id\": \"item1\", \"vault\": {\"id\": \"v1\", \"name\": \"Personal\"}}]")
+                 (when (and (consp destination) (cadr destination))
+                   (with-temp-file (cadr destination) (insert "")))
+                 0))
+              ((symbol-function 'make-temp-file)
+               (lambda (_prefix &rest _args)
+                 (expand-file-name "op-test-vault" temporary-file-directory))))
+      (auth-source-op--cache-refresh)
+      ;; Should have passed --vault=Personal
+      (should (member "--vault=Personal" captured-args))
+      (should (= 1 (length auth-source-op--item-cache))))))
+
+(ert-deftest auth-source-op-test-vault-filter-multiple ()
+  "Test multiple vaults filters client-side."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\", \"vault\": {\"id\": \"v1\", \"name\": \"Personal\"}}, {\"id\": \"item2\", \"vault\": {\"id\": \"v2\", \"name\": \"Work\"}}, {\"id\": \"item3\", \"vault\": {\"id\": \"v3\", \"name\": \"Shared\"}}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil)
+        (auth-source-op--item-timestamps nil)
+        (auth-source-op-vaults '("Personal" "Work")))
+    (auth-source-op-test--with-mocks
+      (auth-source-op--cache-refresh)
+      ;; Should filter to only Personal and Work
+      (should (= 2 (length auth-source-op--item-cache))))))
+
+(ert-deftest auth-source-op-test-vault-filter-none ()
+  "Test nil vaults includes all items."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\", \"vault\": {\"id\": \"v1\", \"name\": \"Personal\"}}, {\"id\": \"item2\", \"vault\": {\"id\": \"v2\", \"name\": \"Work\"}}]" "")))
+        (auth-source-op--item-cache nil)
+        (auth-source-op--cache-timestamp nil)
+        (auth-source-op--item-timestamps nil)
+        (auth-source-op-vaults nil))
+    (auth-source-op-test--with-mocks
+      (auth-source-op--cache-refresh)
+      (should (= 2 (length auth-source-op--item-cache))))))
+
+(ert-deftest auth-source-op-test-disambiguate-inhibit-interaction ()
+  "Test that inhibit-interaction returns first item without prompting."
+  (let ((inhibit-interaction t)
+        (items '(((id . "item1") (title . "First"))
+                 ((id . "item2") (title . "Second")))))
+    (should (equal (car items)
+                   (auth-source-op--disambiguate items)))))
+
+(ert-deftest auth-source-op-test-refresh-cache-command ()
+  "Test that refresh-cache command clears and re-fetches."
+  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
+        (auth-source-op-test--mock-call-results
+         '((0 "[{\"id\": \"item1\"}]" "")))
+        (auth-source-op--item-cache '(((id . "old"))))
+        (auth-source-op--cache-timestamp nil)
+        (auth-source-op--item-timestamps nil)
+        (auth-source-op-vaults nil))
+    (auth-source-op-test--with-mocks
+      (auth-source-op-refresh-cache)
+      (should auth-source-op--item-cache)
+      (should (equal "item1" (alist-get 'id (car auth-source-op--item-cache)))))))
+
+(ert-deftest auth-source-op-test-search-error-resilience ()
+  "Test that search catches errors and returns nil."
+  (let ((auth-source-op--item-cache '(((id . "item1")
+                                        (title . "Test")
+                                        (urls . [((href . "https://example.com"))])))))
+    ;; Force an error during fetch-and-map-item
+    (cl-letf (((symbol-function 'auth-source-op--fetch-and-map-item)
+               (lambda (_item) (error "Simulated failure")))
+              ((symbol-function 'display-warning) #'ignore))
+      (should-not (auth-source-op--search :host "example.com")))))
+
 (provide 'auth-source-op-test)
 ;;; auth-source-op-test.el ends here
