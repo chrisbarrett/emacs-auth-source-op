@@ -118,10 +118,12 @@ Returns a string showing the item title and first URL hostname."
 (defun auth-source-op--disambiguate (items)
   "Prompt user to select one item from ITEMS.
 Returns the selected item, or nil if cancelled.
-If ITEMS contains only one element, returns it without prompting."
+If ITEMS contains only one element, returns it without prompting.
+Returns the first item when interactive prompting is inhibited."
   (cond
    ((null items) nil)
-   ((null (cdr items)) (car items))  ; Single item, no prompt needed
+   ((null (cdr items)) (car items))
+   ((bound-and-true-p inhibit-interaction) (car items))
    (t
     (let* ((candidates (mapcar (lambda (item)
                                  (cons (auth-source-op--format-item-for-display item) item))
@@ -133,6 +135,11 @@ If ITEMS contains only one element, returns it without prompting."
         (cdr (assoc choice candidates)))))))
 
 ;;; Field Mapping
+
+(defvar auth-source-op--secret-closures nil
+  "Hash table mapping item IDs to their secret closures.
+Used to deduplicate closures so the same item-id always returns
+the same closure object.")
 
 (defconst auth-source-op--username-field-names
   '("username" "user" "email" "login" "account")
@@ -233,22 +240,6 @@ global variable.  It cannot be accessed by inspecting the closure registry."
                              (setq cached-secret nil)
                              (setq expiry-timer nil)))))
       cached-secret)))
-
-(defun auth-source-op--map-item-to-auth-source (item)
-  "Map a 1Password ITEM summary to an auth-source result.
-Returns a plist with :host, :port, :user, and :secret keys.
-The :secret value is a zero-arg closure for deferred retrieval.
-Returns nil if the item cannot be mapped."
-  (let ((item-id (alist-get 'id item))
-        (title (alist-get 'title item))
-        (urls (auth-source-op--item-urls item)))
-    (when item-id
-      (let ((host (or (auth-source-op--extract-hostname (car urls))
-                      title)))
-        (list :host host
-              :port nil  ; 1Password items don't have port metadata
-              :user nil  ; Will be populated when full item is fetched
-              :secret (auth-source-op--make-secret-closure item-id))))))
 
 (defun auth-source-op--fetch-and-map-item (item)
   "Fetch full details for ITEM and map to auth-source result.
@@ -357,11 +348,6 @@ This is a list of item summaries from `op item list --format=json'.")
   "Hash table mapping item IDs to their `updated_at' timestamps.
 Used to detect stale items when re-fetching.")
 
-(defvar auth-source-op--secret-closures nil
-  "Hash table mapping item IDs to their secret closures.
-Used to deduplicate closures so the same item-id always returns
-the same closure object.")
-
 (defun auth-source-op--extract-item-timestamp (item)
   "Extract the `updated_at' timestamp from ITEM.
 Returns the timestamp string, or nil if not present."
@@ -377,37 +363,6 @@ ITEMS is a list of 1Password item summaries."
         (when (and id timestamp)
           (puthash id timestamp index))))
     index))
-
-(defun auth-source-op--item-stale-p (item)
-  "Check if ITEM has been updated since it was cached.
-Returns non-nil if the item's `updated_at' timestamp differs from cached.
-Returns nil if item is not stale, or if no cached timestamp exists."
-  (when auth-source-op--item-timestamps
-    (let* ((id (alist-get 'id item))
-           (current-timestamp (auth-source-op--extract-item-timestamp item))
-           (cached-timestamp (gethash id auth-source-op--item-timestamps)))
-      (and cached-timestamp
-           current-timestamp
-           (not (equal cached-timestamp current-timestamp))))))
-
-(defun auth-source-op--detect-stale-items ()
-  "Fetch current item list and return items that have changed since caching.
-Returns a list of (ITEM . OLD-TIMESTAMP) for items whose `updated_at'
-has changed. Returns nil if no stale items or on fetch failure."
-  (let ((current-items (auth-source-op--call-op "item" "list" "--format=json")))
-    (when (and current-items
-               (not (eq current-items t))
-               auth-source-op--item-timestamps)
-      (let ((items-list (if (vectorp current-items)
-                            (append current-items nil)
-                          current-items))
-            stale-items)
-        (dolist (item items-list)
-          (when (auth-source-op--item-stale-p item)
-            (let* ((id (alist-get 'id item))
-                   (old-timestamp (gethash id auth-source-op--item-timestamps)))
-              (push (cons item old-timestamp) stale-items))))
-        (nreverse stale-items)))))
 
 (defun auth-source-op--cache-get ()
   "Return cached items, fetching from `op' if cache is empty.
@@ -429,6 +384,7 @@ When a single vault is configured, uses --vault flag for efficiency."
                                              (format "--vault=%s" single-vault)
                                              "--format=json")
                   (auth-source-op--call-op "item" "list" "--format=json"))))
+    ;; `call-op' returns t for empty stdout on success; guard against it.
     (when (and items (not (eq items t)))
       (let ((items-list (if (vectorp items) (append items nil) items)))
         (setq auth-source-op--item-cache
@@ -511,65 +467,61 @@ Install it from https://developer.1password.com/docs/cli/"
                        :warning))
     op-path))
 
+(defun auth-source-op--build-args (args)
+  "Build op CLI argument list from ARGS, appending global flags."
+  (append (cl-remove nil args)
+          (when auth-source-op-account
+            (list (format "--account=%s" auth-source-op-account)))))
+
 (defun auth-source-op--call-op (&rest args)
   "Call the `op' CLI with ARGS.
 Returns the parsed JSON output on success.
 Retries on biometric failure up to `auth-source-op-retry-count' times.
-Returns nil on user cancellation or failures (with a warning)."
+Returns nil on user cancellation or failures (with a warning).
+Returns t for successful commands that produce no output."
   (catch 'auth-source-op--return
     (unless (auth-source-op--check-op-available)
       (throw 'auth-source-op--return nil))
     (let ((retry-count 0)
           (max-retries auth-source-op-retry-count)
+          (full-args (auth-source-op--build-args args))
           result)
       (while (and (null result) (<= retry-count max-retries))
         (let ((stderr-file (make-temp-file "op-stderr")))
           (unwind-protect
-              (let* ((command (mapconcat #'shell-quote-argument
-                                         (append (list auth-source-op-executable)
-                                                 args
-                                                 (when auth-source-op-account
-                                                   (list (format "--account=%s" auth-source-op-account))))
-                                         " "))
-                     (full-command (format "%s 2>%s"
-                                           command
-                                           (shell-quote-argument stderr-file)))
-                     (output (with-temp-buffer
-                               (let ((exit-code (call-process-shell-command
-                                                 full-command nil t)))
-                                 (cons exit-code (buffer-string)))))
-                     (exit-code (car output))
-                     (stdout (cdr output))
-                     (stderr (with-temp-buffer
-                               (insert-file-contents stderr-file)
-                               (buffer-string))))
-                (cond
-                 ;; Success
-                 ((zerop exit-code)
-                  (setq result (if (string-empty-p stdout)
-                                   t
-                                 (condition-case nil
-                                     (json-read-from-string stdout)
-                                   (json-error stdout)))))
-                 ;; User cancelled - return nil immediately
-                 ((auth-source-op--user-cancelled-p stderr)
-                  (throw 'auth-source-op--return nil))
-                 ;; Biometric failure - retry
-                 ((auth-source-op--biometric-failure-p stderr)
-                  (setq retry-count (1+ retry-count))
-                  (when (> retry-count max-retries)
+              (with-temp-buffer
+                (let* ((exit-code (apply #'call-process
+                                         auth-source-op-executable nil
+                                         (list (current-buffer) stderr-file)
+                                         nil
+                                         full-args))
+                       (stdout (buffer-string))
+                       (stderr (with-temp-buffer
+                                 (insert-file-contents stderr-file)
+                                 (buffer-string))))
+                  (cond
+                   ((zerop exit-code)
+                    (setq result (if (string-empty-p stdout)
+                                     t
+                                   (condition-case nil
+                                       (json-read-from-string stdout)
+                                     (json-error stdout)))))
+                   ((auth-source-op--user-cancelled-p stderr)
+                    (throw 'auth-source-op--return nil))
+                   ((auth-source-op--biometric-failure-p stderr)
+                    (setq retry-count (1+ retry-count))
+                    (when (> retry-count max-retries)
+                      (display-warning 'auth-source-op
+                                       (format "Biometric authentication failed after %d attempts"
+                                               max-retries)
+                                       :error)
+                      (throw 'auth-source-op--return nil)))
+                   (t
                     (display-warning 'auth-source-op
-                                     (format "Biometric authentication failed after %d attempts"
-                                             max-retries)
+                                     (format "`%s' command failed: %s"
+                                             auth-source-op-executable stderr)
                                      :error)
-                    (throw 'auth-source-op--return nil)))
-                 ;; Unexpected error
-                 (t
-                  (display-warning 'auth-source-op
-                                   (format "`%s' command failed: %s"
-                                           auth-source-op-executable stderr)
-                                   :error)
-                  (throw 'auth-source-op--return nil))))
+                    (throw 'auth-source-op--return nil)))))
             (when (file-exists-p stderr-file)
               (delete-file stderr-file)))))
       result)))
@@ -594,7 +546,7 @@ Returns a list of plists with :host, :user, and :secret keys."
   (when (eq host t)
     (cl-return-from auth-source-op--search nil))
   (condition-case err
-      (let* ((items (auth-source-op--search-items host))
+      (let* ((items (auth-source-op--search-items host host))
              (max (or max 1))
              results)
         ;; Disambiguate if multiple items match and we only want one

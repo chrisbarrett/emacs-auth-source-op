@@ -39,38 +39,27 @@
      (cl-letf (((symbol-function 'executable-find)
                 (lambda (_cmd)
                   auth-source-op-test--mock-executable-find))
-               ((symbol-function 'call-process-shell-command)
-                (lambda (_cmd &optional _infile buffer &rest _args)
+               ((symbol-function 'call-process)
+                (lambda (_program &optional _infile destination _display &rest _args)
                   (let* ((result (nth auth-source-op-test--mock-call-count
                                       auth-source-op-test--mock-call-results))
                          (exit-code (nth 0 result))
-                         (stdout (nth 1 result))
-                         (stderr (nth 2 result)))
+                         (stdout (or (nth 1 result) ""))
+                         (stderr (or (nth 2 result) ""))
+                         (stderr-file (when (consp destination) (cadr destination))))
                     (setq auth-source-op-test--mock-call-count
                           (1+ auth-source-op-test--mock-call-count))
-                    ;; Write stderr to temp file (which was created by the real code)
-                    ;; Actually, we need to mock differently - let's write to a known file
-                    (when (and buffer (bufferp buffer))
-                      (with-current-buffer buffer
-                        (insert stdout)))
-                    (when buffer
-                      (with-current-buffer (if (bufferp buffer) buffer
-                                             (current-buffer))
-                        (insert stdout)))
+                    (insert stdout)
+                    (when stderr-file
+                      (with-temp-file stderr-file
+                        (insert stderr)))
                     exit-code)))
                ((symbol-function 'make-temp-file)
                 (lambda (_prefix &rest _args)
-                  (let ((f (expand-file-name
-                            (format "op-test-stderr-%d"
-                                    auth-source-op-test--mock-call-count)
-                            temporary-file-directory)))
-                    ;; Pre-write the stderr content
-                    (let* ((result (nth auth-source-op-test--mock-call-count
-                                        auth-source-op-test--mock-call-results))
-                           (stderr (or (nth 2 result) "")))
-                      (with-temp-file f
-                        (insert stderr)))
-                    f))))
+                  (expand-file-name
+                   (format "op-test-stderr-%d"
+                           auth-source-op-test--mock-call-count)
+                   temporary-file-directory))))
        ,@body)))
 
 ;;; Tests for Error Pattern Detection
@@ -161,7 +150,7 @@
         (should (= 3 auth-source-op-test--mock-call-count))))))
 
 (ert-deftest auth-source-op-test-call-op-biometric-exhausted ()
-  "Test that exhausted biometric retries signal error."
+  "Test that exhausted biometric retries returns nil."
   (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
         (auth-source-op-test--mock-call-results
          '((1 "" "error: authorization denied")
@@ -170,17 +159,15 @@
            (1 "" "error: authorization denied")))
         (auth-source-op-retry-count 3))
     (auth-source-op-test--with-mocks
-      (should-error (auth-source-op--call-op "item" "get" "test")
-                    :type 'error))))
+      (should-not (auth-source-op--call-op "item" "get" "test")))))
 
 (ert-deftest auth-source-op-test-call-op-unexpected-error ()
-  "Test that unexpected errors signal with stderr content."
+  "Test that unexpected errors return nil."
   (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
         (auth-source-op-test--mock-call-results
          '((1 "" "error: vault not found"))))
     (auth-source-op-test--with-mocks
-      (should-error (auth-source-op--call-op "vault" "list")
-                    :type 'error))))
+      (should-not (auth-source-op--call-op "vault" "list")))))
 
 (ert-deftest auth-source-op-test-call-op-empty-output ()
   "Test that empty output returns t (success with no data)."
@@ -704,31 +691,6 @@
     (should (equal "2025-01-15T11:00:00Z" (gethash "item2" index)))
     (should-not (gethash "item3" index))))  ; Missing timestamp not indexed
 
-(ert-deftest auth-source-op-test-item-stale-p-detects-change ()
-  "Test that stale detection identifies changed timestamps."
-  (let ((auth-source-op--item-timestamps (make-hash-table :test 'equal)))
-    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
-    ;; Same timestamp - not stale
-    (let ((item '((id . "item1") (updated_at . "2025-01-15T10:00:00Z"))))
-      (should-not (auth-source-op--item-stale-p item)))
-    ;; Different timestamp - stale
-    (let ((item '((id . "item1") (updated_at . "2025-01-15T12:00:00Z"))))
-      (should (auth-source-op--item-stale-p item)))))
-
-(ert-deftest auth-source-op-test-item-stale-p-no-cached-timestamp ()
-  "Test that items without cached timestamps are not considered stale."
-  (let ((auth-source-op--item-timestamps (make-hash-table :test 'equal)))
-    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
-    ;; New item not in cache - not stale (it's new, not changed)
-    (let ((item '((id . "item2") (updated_at . "2025-01-15T12:00:00Z"))))
-      (should-not (auth-source-op--item-stale-p item)))))
-
-(ert-deftest auth-source-op-test-item-stale-p-no-timestamp-table ()
-  "Test that nil timestamp table means nothing is stale."
-  (let ((auth-source-op--item-timestamps nil))
-    (let ((item '((id . "item1") (updated_at . "2025-01-15T12:00:00Z"))))
-      (should-not (auth-source-op--item-stale-p item)))))
-
 (ert-deftest auth-source-op-test-cache-refresh-builds-timestamp-index ()
   "Test that cache refresh builds the timestamp index."
   (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
@@ -752,42 +714,6 @@
     (puthash "test" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
     (auth-source-op--cache-clear)
     (should-not auth-source-op--item-timestamps)))
-
-(ert-deftest auth-source-op-test-detect-stale-items ()
-  "Test detection of stale items."
-  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
-        (auth-source-op-test--mock-call-results
-         '((0 "[{\"id\": \"item1\", \"updated_at\": \"2025-01-15T12:00:00Z\"}, {\"id\": \"item2\", \"updated_at\": \"2025-01-15T10:00:00Z\"}]" "")))
-        (auth-source-op--item-timestamps (make-hash-table :test 'equal)))
-    ;; Set up cached timestamps - item1 has old timestamp, item2 is unchanged
-    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
-    (puthash "item2" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
-    (auth-source-op-test--with-mocks
-      (let ((stale (auth-source-op--detect-stale-items)))
-        ;; Only item1 should be stale (timestamp changed)
-        (should (= 1 (length stale)))
-        (should (equal "item1" (alist-get 'id (car (car stale)))))
-        ;; Old timestamp should be returned
-        (should (equal "2025-01-15T10:00:00Z" (cdr (car stale))))))))
-
-(ert-deftest auth-source-op-test-detect-stale-items-empty-cache ()
-  "Test that stale detection returns nil with no cached timestamps."
-  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
-        (auth-source-op-test--mock-call-results
-         '((0 "[{\"id\": \"item1\", \"updated_at\": \"2025-01-15T12:00:00Z\"}]" "")))
-        (auth-source-op--item-timestamps nil))
-    (auth-source-op-test--with-mocks
-      (should-not (auth-source-op--detect-stale-items)))))
-
-(ert-deftest auth-source-op-test-detect-stale-items-no-changes ()
-  "Test that stale detection returns nil when nothing changed."
-  (let ((auth-source-op-test--mock-executable-find "/usr/local/bin/op")
-        (auth-source-op-test--mock-call-results
-         '((0 "[{\"id\": \"item1\", \"updated_at\": \"2025-01-15T10:00:00Z\"}]" "")))
-        (auth-source-op--item-timestamps (make-hash-table :test 'equal)))
-    (puthash "item1" "2025-01-15T10:00:00Z" auth-source-op--item-timestamps)
-    (auth-source-op-test--with-mocks
-      (should-not (auth-source-op--detect-stale-items)))))
 
 ;;; Tests for Cache Management UI
 
