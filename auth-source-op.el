@@ -634,9 +634,7 @@ Returns the backend when ENTRY is the symbol \\='1password, nil otherwise."
 
 ;;;###autoload
 (defun auth-source-op-enable ()
-  "Enable 1Password as an auth-source backend.
-Adds \\='1password to the front of `auth-sources'."
-  (interactive)
+  "Enable 1Password as an auth-source backend."
   (unless (auth-source-op--check-op-available)
     (user-error "Cannot enable auth-source-op: `%s' CLI not found"
                 auth-source-op-executable))
