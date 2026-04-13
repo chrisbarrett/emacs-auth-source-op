@@ -45,6 +45,14 @@
   :type 'integer
   :group 'auth-source-op)
 
+(defcustom auth-source-op-account nil
+  "1Password account to use when multiple accounts are configured.
+Can be an account shorthand, sign-in address, account UUID, or user UUID.
+When nil, `op' uses its default account (fails if multiple exist)."
+  :type '(choice (const :tag "Default" nil)
+                 (string :tag "Account"))
+  :group 'auth-source-op)
+
 (defcustom auth-source-op-vaults nil
   "List of 1Password vaults to search for credentials.
 Each element can be a vault name (e.g., \"Personal\") or vault ID.
@@ -511,8 +519,11 @@ Signals an error on unexpected failures."
           result)
       (while (and (null result) (<= retry-count max-retries))
         (let* ((stderr-file (make-temp-file "op-stderr"))
+               (full-args (if auth-source-op-account
+                              (append args (list (format "--account=%s" auth-source-op-account)))
+                            args))
                (command (mapconcat #'shell-quote-argument
-                                   (cons "op" args)
+                                   (cons "op" full-args)
                                    " "))
                (full-command (format "%s 2>%s"
                                      command
