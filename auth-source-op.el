@@ -186,13 +186,16 @@ Returns the field value as a string, or nil if not found."
 Returns the username as a string, or nil if not found."
   (auth-source-op--find-field-value item auth-source-op--username-field-names))
 
-(defun auth-source-op--make-secret-closure (item-id)
+(defun auth-source-op--make-secret-closure (item-id &optional initial-secret)
   "Get or create a secret closure for ITEM-ID.
 Returns a cached closure if one exists for ITEM-ID, otherwise creates
 a new one.  The closure implements TTL-based caching: the secret is
 fetched from 1Password on first access, cached in a lexical binding,
 and proactively deleted when `auth-source-op-secret-ttl' expires.
 Accessing the secret resets the TTL timer (sliding window).
+
+When INITIAL-SECRET is provided, the closure is pre-seeded to avoid
+a redundant `op item get' call on first access.
 
 The closure registry (`auth-source-op--secret-closures') maps item-ids
 to closures, ensuring deduplication.  The registry is cleared when the
@@ -202,14 +205,17 @@ item-list cache is cleared."
     (setq auth-source-op--secret-closures (make-hash-table :test 'equal)))
   ;; Return existing closure or create new one
   (or (gethash item-id auth-source-op--secret-closures)
-      (let ((closure (auth-source-op--create-secret-closure item-id)))
+      (let ((closure (auth-source-op--create-secret-closure
+                      item-id initial-secret)))
         (puthash item-id closure auth-source-op--secret-closures)
         closure)))
 
-(defun auth-source-op--create-secret-closure (item-id)
+(defun auth-source-op--create-secret-closure (item-id &optional initial-secret)
   "Create a new secret closure for ITEM-ID.
 This is an internal function; use `auth-source-op--make-secret-closure'
 to get a deduplicated closure.
+
+When INITIAL-SECRET is non-nil, the closure starts pre-seeded.
 
 The closure uses the let-over-lambda pattern to capture its own state:
 - cached-secret: the cached secret value (nil when not cached or expired)
@@ -217,7 +223,7 @@ The closure uses the let-over-lambda pattern to capture its own state:
 
 Security: The secret is stored only in the lexical binding, not in any
 global variable.  It cannot be accessed by inspecting the closure registry."
-  (let ((cached-secret nil)
+  (let ((cached-secret initial-secret)
         (expiry-timer nil))
     (lambda ()
       ;; Cancel existing timer if any (we'll create a new one)
@@ -253,11 +259,13 @@ Returns nil if the item cannot be fetched or mapped."
     (when full-item
       (let ((host (or (auth-source-op--extract-hostname (car urls))
                       title))
-            (user (auth-source-op--extract-username full-item)))
+            (user (auth-source-op--extract-username full-item))
+            (secret (auth-source-op--find-field-value
+                     full-item auth-source-op--secret-field-names 'password)))
         (list :host host
               :port nil  ; 1Password items don't have port metadata
               :user user
-              :secret (auth-source-op--make-secret-closure item-id))))))
+              :secret (auth-source-op--make-secret-closure item-id secret))))))
 
 ;;; Item Search
 
