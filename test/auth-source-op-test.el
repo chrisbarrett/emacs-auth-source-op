@@ -1014,6 +1014,19 @@
       (should auth-source-op--item-cache)
       (should (equal "item1" (alist-get 'id (car auth-source-op--item-cache)))))))
 
+(ert-deftest auth-source-op-test-user-matches-exact ()
+  "Test exact user match."
+  (should (auth-source-op--user-matches-p "alice" "alice"))
+  (should-not (auth-source-op--user-matches-p "alice" "bob"))
+  (should-not (auth-source-op--user-matches-p "alice" nil)))
+
+(ert-deftest auth-source-op-test-user-matches-caret-prefix ()
+  "Test that user^package matches base user from 1Password."
+  (should (auth-source-op--user-matches-p "chrisbarrett^forge" "chrisbarrett"))
+  (should (auth-source-op--user-matches-p "user^ghub" "user"))
+  (should-not (auth-source-op--user-matches-p "chrisbarrett^forge" "other"))
+  (should-not (auth-source-op--user-matches-p "chrisbarrett^forge" nil)))
+
 (ert-deftest auth-source-op-test-search-error-resilience ()
   "Test that search catches errors and returns nil."
   (let ((auth-source-op--item-cache '(((id . "item1")

@@ -526,6 +526,20 @@ Returns t for successful commands that produce no output."
               (delete-file stderr-file)))))
       result)))
 
+;;; User Matching
+
+(defun auth-source-op--user-matches-p (requested actual)
+  "Return non-nil if REQUESTED user matches ACTUAL user from 1Password.
+Matches exactly, or when ACTUAL is the base part of REQUESTED before
+a caret (e.g., requested \"user^forge\" matches actual \"user\").
+This accommodates ghub/forge which appends \"^package\" to usernames."
+  (or (equal requested actual)
+      (and actual
+           requested
+           (string-match-p "\\^" requested)
+           (equal (car (split-string requested "\\^"))
+                  actual))))
+
 ;;; Auth-Source Backend
 
 (cl-defun auth-source-op--search (&rest spec
@@ -562,7 +576,8 @@ Returns a list of plists with :host, :user, and :secret keys."
             ;; Filter by user if specified
             (when (or (null user)
                       (eq user t)
-                      (equal user (plist-get result :user)))
+                      (auth-source-op--user-matches-p
+                       user (plist-get result :user)))
               (push result results))))
         (nreverse results))
     (error
