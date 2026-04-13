@@ -40,6 +40,11 @@
   :group 'auth-source
   :prefix "auth-source-op-")
 
+(defcustom auth-source-op-executable "op"
+  "Path or name of the 1Password CLI executable."
+  :type 'string
+  :group 'auth-source-op)
+
 (defcustom auth-source-op-retry-count 3
   "Maximum number of retries for biometric authentication failures."
   :type 'integer
@@ -50,7 +55,7 @@
 Can be an account shorthand, sign-in address, account UUID, or user UUID.
 When nil, `op' uses its default account (fails if multiple exist)."
   :type '(choice (const :tag "Default" nil)
-                 (string :tag "Account"))
+          (string :tag "Account"))
   :group 'auth-source-op)
 
 (defcustom auth-source-op-vaults nil
@@ -497,11 +502,12 @@ Shows item titles and hostnames, but never displays secrets."
   "Check if the `op' CLI is available.
 Returns the path to `op' if found, nil otherwise.
 Displays a warning if `op' is not found."
-  (let ((op-path (executable-find "op")))
+  (let ((op-path (executable-find auth-source-op-executable)))
     (unless op-path
       (display-warning 'auth-source-op
-                       "1Password CLI `op' not found in PATH. \
+                       (format "1Password CLI `%s' not found in PATH. \
 Install it from https://developer.1password.com/docs/cli/"
+                               auth-source-op-executable)
                        :warning))
     op-path))
 
@@ -509,8 +515,7 @@ Install it from https://developer.1password.com/docs/cli/"
   "Call the `op' CLI with ARGS.
 Returns the parsed JSON output on success.
 Retries on biometric failure up to `auth-source-op-retry-count' times.
-Returns nil silently on user cancellation.
-Signals an error on unexpected failures."
+Returns nil on user cancellation or failures (with a warning)."
   (catch 'auth-source-op--return
     (unless (auth-source-op--check-op-available)
       (throw 'auth-source-op--return nil))
@@ -518,46 +523,55 @@ Signals an error on unexpected failures."
           (max-retries auth-source-op-retry-count)
           result)
       (while (and (null result) (<= retry-count max-retries))
-        (let* ((stderr-file (make-temp-file "op-stderr"))
-               (full-args (if auth-source-op-account
-                              (append args (list (format "--account=%s" auth-source-op-account)))
-                            args))
-               (command (mapconcat #'shell-quote-argument
-                                   (cons "op" full-args)
-                                   " "))
-               (full-command (format "%s 2>%s"
-                                     command
-                                     (shell-quote-argument stderr-file)))
-               (output (with-temp-buffer
-                         (let ((exit-code (call-process-shell-command
-                                           full-command nil t)))
-                           (cons exit-code (buffer-string)))))
-               (exit-code (car output))
-               (stdout (cdr output))
-               (stderr (with-temp-buffer
-                         (insert-file-contents stderr-file)
-                         (buffer-string))))
-          (delete-file stderr-file)
-          (cond
-           ;; Success
-           ((zerop exit-code)
-            (setq result (if (string-empty-p stdout)
-                             t
-                           (condition-case nil
-                               (json-read-from-string stdout)
-                             (json-error stdout)))))
-           ;; User cancelled - return nil immediately
-           ((auth-source-op--user-cancelled-p stderr)
-            (throw 'auth-source-op--return nil))
-           ;; Biometric failure - retry
-           ((auth-source-op--biometric-failure-p stderr)
-            (setq retry-count (1+ retry-count))
-            (when (> retry-count max-retries)
-              (error "auth-source-op: Biometric authentication failed after %d attempts"
-                     max-retries)))
-           ;; Unexpected error
-           (t
-            (error "auth-source-op: `op' command failed: %s" stderr)))))
+        (let ((stderr-file (make-temp-file "op-stderr")))
+          (unwind-protect
+              (let* ((command (mapconcat #'shell-quote-argument
+                                         (append (list auth-source-op-executable)
+                                                 args
+                                                 (when auth-source-op-account
+                                                   (list (format "--account=%s" auth-source-op-account))))
+                                         " "))
+                     (full-command (format "%s 2>%s"
+                                           command
+                                           (shell-quote-argument stderr-file)))
+                     (output (with-temp-buffer
+                               (let ((exit-code (call-process-shell-command
+                                                 full-command nil t)))
+                                 (cons exit-code (buffer-string)))))
+                     (exit-code (car output))
+                     (stdout (cdr output))
+                     (stderr (with-temp-buffer
+                               (insert-file-contents stderr-file)
+                               (buffer-string))))
+                (cond
+                 ;; Success
+                 ((zerop exit-code)
+                  (setq result (if (string-empty-p stdout)
+                                   t
+                                 (condition-case nil
+                                     (json-read-from-string stdout)
+                                   (json-error stdout)))))
+                 ;; User cancelled - return nil immediately
+                 ((auth-source-op--user-cancelled-p stderr)
+                  (throw 'auth-source-op--return nil))
+                 ;; Biometric failure - retry
+                 ((auth-source-op--biometric-failure-p stderr)
+                  (setq retry-count (1+ retry-count))
+                  (when (> retry-count max-retries)
+                    (display-warning 'auth-source-op
+                                     (format "Biometric authentication failed after %d attempts"
+                                             max-retries)
+                                     :error)
+                    (throw 'auth-source-op--return nil)))
+                 ;; Unexpected error
+                 (t
+                  (display-warning 'auth-source-op
+                                   (format "`%s' command failed: %s"
+                                           auth-source-op-executable stderr)
+                                   :error)
+                  (throw 'auth-source-op--return nil))))
+            (when (file-exists-p stderr-file)
+              (delete-file stderr-file)))))
       result)))
 
 ;;; Auth-Source Backend
@@ -579,25 +593,31 @@ Returns a list of plists with :host, :user, and :secret keys."
   ;; Handle wildcard host - we don't support it
   (when (eq host t)
     (cl-return-from auth-source-op--search nil))
-  (let* ((items (auth-source-op--search-items host))
-         (max (or max 1))
-         results)
-    ;; Disambiguate if multiple items match and we only want one
-    (when (and items (= max 1) (> (length items) 1))
-      (setq items (list (auth-source-op--disambiguate items))))
-    ;; Filter out nil (from cancelled disambiguation)
-    (setq items (delq nil items))
-    ;; Limit to max results
-    (setq items (seq-take items max))
-    ;; Fetch full details and map to auth-source format
-    (dolist (item items)
-      (when-let* ((result (auth-source-op--fetch-and-map-item item)))
-        ;; Filter by user if specified
-        (when (or (null user)
-                  (eq user t)
-                  (equal user (plist-get result :user)))
-          (push result results))))
-    (nreverse results)))
+  (condition-case err
+      (let* ((items (auth-source-op--search-items host))
+             (max (or max 1))
+             results)
+        ;; Disambiguate if multiple items match and we only want one
+        (when (and items (= max 1) (> (length items) 1))
+          (setq items (list (auth-source-op--disambiguate items))))
+        ;; Filter out nil (from cancelled disambiguation)
+        (setq items (delq nil items))
+        ;; Limit to max results
+        (setq items (seq-take items max))
+        ;; Fetch full details and map to auth-source format
+        (dolist (item items)
+          (when-let* ((result (auth-source-op--fetch-and-map-item item)))
+            ;; Filter by user if specified
+            (when (or (null user)
+                      (eq user t)
+                      (equal user (plist-get result :user)))
+              (push result results))))
+        (nreverse results))
+    (error
+     (display-warning 'auth-source-op
+                      (format "Search failed: %s" (error-message-string err))
+                      :error)
+     nil)))
 
 (defvar auth-source-op-backend
   (auth-source-backend
@@ -618,7 +638,8 @@ Returns the backend when ENTRY is the symbol \\='1password, nil otherwise."
 Adds \\='1password to the front of `auth-sources'."
   (interactive)
   (unless (auth-source-op--check-op-available)
-    (user-error "Cannot enable auth-source-op: `op' CLI not found"))
+    (user-error "Cannot enable auth-source-op: `%s' CLI not found"
+                auth-source-op-executable))
   (add-hook 'auth-source-backend-parser-functions #'auth-source-op--backend-parse)
   (add-to-list 'auth-sources '1password))
 
